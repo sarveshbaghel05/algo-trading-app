@@ -5,7 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 import requests
 import pyotp
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 # पेज सेटिंग्स (Option Seller Edition)
@@ -162,8 +162,70 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
     return pd.DataFrame(rows), spot_price, exp_str, None
 
+def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
+    """Angel One SmartAPI से 1-मिनट का असली हिस्टोरिकल स्पॉट डेटा लाना"""
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "X-PrivateKey": api_key.strip()
+    }
+    hist_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
+
+    idx_map = {
+        "Nifty 50": {"exch": "NSE", "token": "99926000"},
+        "Bank Nifty": {"exch": "NSE", "token": "99926009"},
+        "Sensex": {"exch": "BSE", "token": "99919000"}
+    }[selected_idx]
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+    all_candles = []
+
+    # Angel One एक बार में अधिकतम 30 दिनों का 1-मिनट डेटा देता है, इसलिए 30-30 दिन के स्लॉट में लाना
+    remaining_days = days_count
+    end_dt = now_ist
+
+    while remaining_days > 0:
+        chunk_days = min(30, remaining_days)
+        start_dt = end_dt - timedelta(days=chunk_days)
+        payload = {
+            "exchange": idx_map["exch"],
+            "symboltoken": idx_map["token"],
+            "interval": "ONE_MINUTE",
+            "fromdate": start_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": end_dt.strftime("%Y-%m-%d 15:30")
+        }
+        try:
+            res = requests.post(hist_url, json=payload, headers=headers, timeout=15).json()
+            if res.get("status") and res.get("data"):
+                all_candles.extend(res["data"])
+        except Exception:
+            break
+
+        end_dt = start_dt - timedelta(minutes=1)
+        remaining_days -= chunk_days
+
+    if not all_candles:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_candles, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    if df["Timestamp"].dt.tz is None:
+        df["Timestamp"] = df["Timestamp"].dt.tz_localize("Asia/Kolkata")
+    else:
+        df["Timestamp"] = df["Timestamp"].dt.tz_convert("Asia/Kolkata")
+
+    df = df.drop_duplicates(subset=["Timestamp"]).sort_values("Timestamp").set_index("Timestamp")
+    return df
+
 # दो मुख्य टैब
-tab1, tab2 = st.tabs(["⛓️ ऑप्शन सेलर लाइव चेन (Angel One Live)", "📊 10:00 AM Chg OI (₹2000/Lot SL)"])
+tab1, tab2 = st.tabs(["⛓️ ऑप्शन सेलर लाइव चेन (Angel One Live)", "📊 10:00 AM Chg OI (1-Min Angel Backtest)"])
 
 # ==========================================
 # TAB 1: ऑप्शन सेलर लाइव ऑप्शन चेन और सिग्नल
@@ -230,7 +292,6 @@ with tab1:
                 st.session_state["angel_jwt"], st.session_state["angel_key"], selected_idx, s_range
             )
             if err_msg:
-                # अगर सेशन एक्सपायर हो जाए तो Secrets से दोबारा ऑटो-लॉगिन करना
                 if "ANGEL_API_KEY" in st.secrets:
                     new_jwt, _ = angel_login(
                         st.secrets["ANGEL_API_KEY"], st.secrets["ANGEL_CLIENT_ID"],
@@ -390,31 +451,31 @@ with tab1:
     render_seller_chain(idx, strike_range)
 
 # ==========================================
-# TAB 2: सुबह 10:00 AM Change in OI — ATM Sell + 300/1000 Hedge (₹2000/Lot SL)
+# TAB 2: सुबह 10:00 AM Change in OI — 1-Min Angel One Historical Backtest
 # ==========================================
 with tab2:
-    st.subheader("🎯 सुबह 10:00 AM — Change in OI (ATM Sell + Hedge | ₹2,000 प्रति लॉट SL)")
+    st.subheader("🎯 सुबह 10:00 AM — Change in OI (Angel One 1-Min स्पॉट बैकटेस्ट)")
     st.info("""
-    **आपका ट्रेडिंग नियम:**
-    * **सुबह 10:00 AM स्कैन:** ATM से ऊपर की 3 स्ट्राइक का Call Change in OI vs नीचे की 3 स्ट्राइक का Put Change in OI।
+    **सटीक 1-मिनट बैकटेस्टिंग नियम:**
+    * **डेटा स्रोत:** Angel One SmartAPI का **1-मिनट असली हिस्टोरिकल स्पॉट डेटा** (ठीक सुबह 10:00:00 AM एंट्री और 3:15:00 PM एग्जिट)।
     * **Nifty / Bank Nifty:** ATM Sell + **300 पॉइंट दूर** Hedge Buy | **Sensex:** ATM Sell + **1000 पॉइंट दूर** Hedge Buy।
-    * **Stop-Loss नियम:** **₹2,000 प्रति लॉट (Per Lot)** — जैसे 1 लॉट पर ₹2,000, 2 लॉट पर ₹4,000।
+    * **Stop-Loss नियम:** **₹2,000 प्रति लॉट (Per Lot)** फिक्स्ड नुकसान सीमा।
     """)
 
     b1, b2, b3 = st.columns(3)
     with b1:
         bt_idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty", "Sensex"], key="bt_idx")
     with b2:
-        bt_days = st.selectbox("कितने दिनों का बैकटेस्ट?", ["30d (1 महीना)", "60d (2 महीने)"])
+        bt_days = st.selectbox("कितने दिनों का बैकटेस्ट?", ["30 दिन (1-Min Angel Data)", "60 दिन (1-Min Angel Data)", "90 दिन (1-Min Angel Data)"])
     with b3:
         lots = st.number_input("लॉट साइज (Lots)", min_value=1, max_value=50, value=1)
 
     sl_per_lot = 2000.0
     total_sl_rs = sl_per_lot * lots
-    st.caption(f"🛑 **सक्रिय Stop-Loss:** `{lots} लॉट × ₹2,000 = ₹{total_sl_rs:,.0f}` अधिकतम नुकसान सीमा प्रति दिन")
+    st.caption(f"🛑 **सक्रिय Stop-Loss:** `{lots} लॉट × ₹2,000 = ₹{total_sl_rs:,.0f}` प्रति दिन")
 
-    if st.button(f"🚀 10:00 AM बैकटेस्ट चलाएं (₹{total_sl_rs:,.0f} कुल SL)", use_container_width=True):
-        with st.spinner("सुबह 10:00 बजे का Change in OI और ₹2,000/लॉट Stop-Loss बैकटेस्ट चल रहा है..."):
+    if st.button(f"🚀 1-Min असली स्पॉट डेटा पर बैकटेस्ट चलाएं", use_container_width=True):
+        with st.spinner("Angel One SmartAPI से 1-मिनट का असली हिस्टोरिकल स्पॉट डेटा लोड हो रहा है..."):
             if bt_idx == "Nifty 50":
                 bt_sym, step, lot_qty, hedge_points = "^NSEI", 50, 75, 300
             elif bt_idx == "Bank Nifty":
@@ -422,20 +483,35 @@ with tab2:
             else:
                 bt_sym, step, lot_qty, hedge_points = "^BSESN", 100, 20, 1000
 
-            period_str = "30d" if "30d" in bt_days else "60d"
-            intraday = yf.download(bt_sym, period=period_str, interval="5m", progress=False)
+            days_num = int(bt_days.split(" ")[0])
+            intraday = pd.DataFrame()
+            data_source_label = ""
 
-            if isinstance(intraday.columns, pd.MultiIndex):
-                intraday.columns = intraday.columns.get_level_values(0)
+            # 1. पहले Angel One SmartAPI से 1-मिनट का असली स्पॉट डेटा मँगवाना
+            if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+                intraday = fetch_angel_historical_spot(
+                    st.session_state["angel_jwt"], st.session_state["angel_key"], bt_idx, days_num
+                )
+                if not intraday.empty:
+                    data_source_label = "🟢 Angel One 1-Minute Official Historical Data"
+
+            # 2. बैकअप (यदि Angel One से डेटा न मिल पाए)
+            if intraday.empty:
+                period_str = "30d" if days_num <= 30 else "60d"
+                intraday = yf.download(bt_sym, period=period_str, interval="5m", progress=False)
+                if isinstance(intraday.columns, pd.MultiIndex):
+                    intraday.columns = intraday.columns.get_level_values(0)
+                if not intraday.empty:
+                    if intraday.index.tz is None:
+                        intraday.index = intraday.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+                    else:
+                        intraday.index = intraday.index.tz_convert('Asia/Kolkata')
+                    data_source_label = "🟡 Yahoo Finance 5-Minute Backup Data"
 
             if intraday.empty:
-                st.error("इंट्राडे डेटा लोड नहीं हो पाया। कृपया थोड़ी देर बाद पुनः प्रयास करें।")
+                st.error("हिस्टोरिकल डेटा लोड नहीं हो पाया। कृपया थोड़ी देर बाद पुनः प्रयास करें।")
             else:
-                if intraday.index.tz is None:
-                    intraday.index = intraday.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-                else:
-                    intraday.index = intraday.index.tz_convert('Asia/Kolkata')
-
+                st.success(f"डेटा लोड सफल: **{data_source_label}** (कुल {len(intraday):,} कैंडल्स)")
                 intraday['Date'] = intraday.index.date
                 trade_logs = []
 
@@ -443,10 +519,10 @@ with tab2:
                 sl_points_limit = sl_per_lot / lot_qty
 
                 for dt, day_df in intraday.groupby('Date'):
-                    morning_session = day_df.between_time("09:15", "10:00")
+                    morning_session = day_df.between_time("09:15", "09:59")
                     trade_session = day_df.between_time("10:00", "15:15")
                     
-                    if len(morning_session) < 3 or len(trade_session) < 10:
+                    if len(morning_session) < 5 or len(trade_session) < 15:
                         continue
 
                     open_915 = float(morning_session['Open'].iloc[0])
@@ -486,7 +562,7 @@ with tab2:
                     day_pnl_rs = 0.0
                     total_bars = len(trade_session)
 
-                    for idx_bar, (_, row) in enumerate(trade_session.iterrows()):
+                    for idx_bar, (ts, row) in enumerate(trade_session.iterrows()):
                         progress = idx_bar / max(1, total_bars - 1)
                         theta_gain = net_credit * 0.62 * progress
 
@@ -499,7 +575,8 @@ with tab2:
                         unrealized_loss_rs = unrealized_loss_pts * total_qty
 
                         if unrealized_loss_rs >= total_sl_rs:
-                            exit_status = f"SL Hit ❌ (-₹{int(total_sl_rs):,})"
+                            hit_time = ts.strftime("%I:%M %p")
+                            exit_status = f"SL Hit ❌ ({hit_time})"
                             day_pnl_rs = -total_sl_rs
                             day_pts = round(-sl_points_limit, 1)
                             break
@@ -551,10 +628,10 @@ with tab2:
                         name='Cumulative P&L (₹)',
                         line=dict(color='#00e676' if total_pnl >= 0 else '#ff5252', width=3)
                     ))
-                    fig_bt.update_layout(title=f"{bt_idx} — 10:00 AM Change in OI (₹2,000/Lot SL) ग्रोथ चार्ट", xaxis_title="तारीख", yaxis_title="प्रॉफिट / लॉस (₹)", height=360, margin=dict(l=10, r=10, t=40, b=10))
+                    fig_bt.update_layout(title=f"{bt_idx} — 10:00 AM Change in OI (1-Min Angel Spot) ग्रोथ चार्ट", xaxis_title="तारीख", yaxis_title="प्रॉफिट / लॉस (₹)", height=360, margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_bt, use_container_width=True)
 
-                    st.markdown(f"### 📋 तारीख-वार रिपोर्ट (₹2,000 प्रति लॉट Stop-Loss)")
+                    st.markdown(f"### 📋 तारीख-वार 1-मिनट सटीक रिपोर्ट (₹2,000 प्रति लॉट Stop-Loss)")
                     def color_pnl(val):
                         color = '#00e676' if val > 0 else '#ff5252'
                         return f'color: {color}; font-weight: bold;'
@@ -563,6 +640,4 @@ with tab2:
                         "10:00 Spot": "{:,.1f}",
                         "नेट पॉइंट्स": "{:+.1f}",
                         "लाभ / हानि (₹)": "₹{:+,.0f}",
-                        "कुल पूंजी बदलाव (₹)": "₹{:+,.0f}"
-                    })
-                    st.dataframe(styled_res, use_container_width=True, hide_index=True)
+                        "कुल पूंजी बदलाव
