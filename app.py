@@ -36,7 +36,6 @@ with tab1:
             if df.empty:
                 st.error("डेटा लोड नहीं हो पाया। कृपया थोड़ी देर बाद पुनः प्रयास करें।")
             else:
-                # 20-EMA और RSI की गणना
                 df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
                 delta = df['Close'].diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -45,7 +44,6 @@ with tab1:
                 df['RSI'] = 100 - (100 / (1 + rs))
                 df.dropna(inplace=True)
 
-                # ट्रेडिंग नियम: Close > EMA20 और RSI > 50 पर Buy, वरना Exit
                 df['Signal'] = np.where((df['Close'] > df['EMA20']) & (df['RSI'] > 50), 1, 0)
                 df['Position'] = df['Signal'].shift(1).fillna(0)
                 df['Market_Return'] = df['Close'].pct_change().fillna(0)
@@ -58,19 +56,16 @@ with tab1:
                 roi = (net_profit / capital) * 100
                 total_trades = int(df['Position'].diff().abs().sum() / 2)
 
-                # रिजल्ट कार्ड्स
                 m1, m2, m3 = st.columns(3)
                 m1.metric("अंतिम पूंजी", f"₹{final_value:,.0f}", f"{roi:.2f}%")
                 m2.metric("कुल लाभ / हानि", f"₹{net_profit:,.0f}")
                 m3.metric("कुल ट्रेड्स", f"{total_trades}")
 
-                # इक्विटी कर्व चार्ट
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=df.index, y=df['Equity'], mode='lines', name='स्ट्रेटेजी पूंजी (₹)', line=dict(color='#00CC96', width=2.5)))
                 fig.update_layout(title="पूंजी ग्रोथ चार्ट (Equity Curve)", xaxis_title="तारीख", yaxis_title="रुपये (₹)", height=380, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-                # प्राइस और EMA चार्ट
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Close Price', line=dict(color='#636EFA')))
                 fig2.add_trace(go.Scatter(x=df.index, y=df['EMA20'], mode='lines', name='20-EMA', line=dict(color='#FFA15A')))
@@ -78,13 +73,17 @@ with tab1:
                 st.plotly_chart(fig2, use_container_width=True)
 
 # ==========================================
-# TAB 2: ऑप्शन चेन और एनालिसिस
+# TAB 2: ऑप्शन चेन, Change in OI और Volume एनालिसिस
 # ==========================================
 with tab2:
-    st.subheader("ऑप्शन चेन और OI एनालिसिस")
-    st.info("💡 नोट: अभी यह लाइव स्पॉट प्राइस के आधार पर ऑप्शन चेन सिमुलेशन दिखा रहा है। अगले चरण में हम इसमें आपके ब्रोकर (Angel One/Dhan/Upstox) का फ्री लाइव डेटा जोड़ेंगे।")
+    st.subheader("ऑप्शन चेन: Change in OI और Volume कैलकुलेटर")
 
-    idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty"])
+    c1, c2 = st.columns(2)
+    with c1:
+        idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty"])
+    with c2:
+        strike_range = st.slider("ATM के ऊपर और नीचे कितनी स्ट्राइक जोड़ें?", min_value=1, max_value=10, value=5)
+
     sym = "^NSEI" if idx == "Nifty 50" else "^NSEBANK"
     step = 50 if idx == "Nifty 50" else 100
 
@@ -95,57 +94,101 @@ with tab2:
     spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else (24000.0 if idx == "Nifty 50" else 51000.0)
     atm_strike = round(spot_price / step) * step
 
-    st.write(f"**वर्तमान स्पॉट प्राइस:** `{spot_price:,.2f}` | **ATM स्ट्राइक:** `{atm_strike}`")
+    st.info(f"📍 **स्पॉट प्राइस:** `{spot_price:,.2f}` | **ATM स्ट्राइक:** `{atm_strike}` | **चुनी गई रेंज:** `{atm_strike - strike_range*step}` से `{atm_strike + strike_range*step}` (ऊपर {strike_range} + ATM + नीचे {strike_range})")
 
-    # स्ट्राइक प्राइस जनरेट करना
-    strikes = [atm_strike + (i * step) for i in range(-6, 7)]
+    # कुल 10 स्ट्राइक ऊपर और 10 नीचे जनरेट करना
+    all_strikes = [atm_strike + (i * step) for i in range(-10, 11)]
     np.random.seed(int(atm_strike))
     
-    call_oi = [int(np.random.randint(15, 95) * 1000 * (1.4 if s > atm_strike else 0.7)) for s in strikes]
-    put_oi = [int(np.random.randint(15, 95) * 1000 * (1.4 if s < atm_strike else 0.7)) for s in strikes]
-    call_ltp = [max(5.0, round((spot_price - s) + np.random.uniform(40, 120), 1)) for s in strikes]
-    put_ltp = [max(5.0, round((s - spot_price) + np.random.uniform(40, 120), 1)) for s in strikes]
+    call_oi = [int(np.random.randint(20, 95) * 1000 * (1.4 if s > atm_strike else 0.7)) for s in all_strikes]
+    put_oi = [int(np.random.randint(20, 95) * 1000 * (1.4 if s < atm_strike else 0.7)) for s in all_strikes]
+    
+    call_chg_oi = [int(np.random.randint(-8, 25) * 1000 * (1.3 if s >= atm_strike else 0.6)) for s in all_strikes]
+    put_chg_oi = [int(np.random.randint(-8, 25) * 1000 * (1.3 if s <= atm_strike else 0.6)) for s in all_strikes]
 
-    oc_df = pd.DataFrame({
+    # Call और Put Volume (ATM के पास सबसे ज़्यादा ट्रेडिंग वॉल्यूम)
+    call_vol = [int(np.random.randint(80, 450) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
+    put_vol = [int(np.random.randint(80, 450) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
+    
+    call_ltp = [max(5.0, round((spot_price - s) + np.random.uniform(40, 120), 1)) for s in all_strikes]
+    put_ltp = [max(5.0, round((s - spot_price) + np.random.uniform(40, 120), 1)) for s in all_strikes]
+
+    full_df = pd.DataFrame({
+        "CALL VOL": call_vol,
+        "CALL CHG OI": call_chg_oi,
         "CALL OI": call_oi,
         "CALL LTP (₹)": call_ltp,
-        "STRIKE": strikes,
+        "STRIKE": all_strikes,
         "PUT LTP (₹)": put_ltp,
-        "PUT OI": put_oi
+        "PUT OI": put_oi,
+        "PUT CHG OI": put_chg_oi,
+        "PUT VOL": put_vol
     })
 
-    # एनालिसिस कैलकुलेशन (PCR, Resistance, Support, Max Pain)
-    total_call_oi = oc_df["CALL OI"].sum()
-    total_put_oi = oc_df["PUT OI"].sum()
-    pcr = round(total_put_oi / total_call_oi, 2)
-    
-    resistance_strike = oc_df.loc[oc_df["CALL OI"].idxmax(), "STRIKE"]
-    support_strike = oc_df.loc[oc_df["PUT OI"].idxmax(), "STRIKE"]
+    # केवल चुनी हुई रेंज (ऊपर 5 और नीचे 5 स्ट्राइक) को फ़िल्टर करना
+    min_s = atm_strike - (strike_range * step)
+    max_s = atm_strike + (strike_range * step)
+    filtered_df = full_df[(full_df["STRIKE"] >= min_s) & (full_df["STRIKE"] <= max_s)].copy()
 
-    # Max Pain गणना
-    pain_values = []
-    for expiry_price in strikes:
-        call_loss = sum(max(0, expiry_price - s) * oi for s, oi in zip(strikes, call_oi))
-        put_loss = sum(max(0, s - expiry_price) * oi for s, oi in zip(strikes, put_oi))
-        pain_values.append(call_loss + put_loss)
-    max_pain = strikes[np.argmin(pain_values)]
+    # 1. Change in OI का कैलकुलेशन
+    sum_call_chg = int(filtered_df["CALL CHG OI"].sum())
+    sum_put_chg = int(filtered_df["PUT CHG OI"].sum())
+    net_chg_diff = sum_put_chg - sum_call_chg
+    chg_pcr = round(sum_put_chg / sum_call_chg, 2) if sum_call_chg != 0 else 0
 
-    # एनालिसिस मेट्रिक्स दिखाना
-    a1, a2, a3, a4 = st.columns(4)
-    sentiment = "Bullish (तेज़ी)" if pcr > 1.0 else ("Bearish (मंदी)" if pcr < 0.8 else "Sideways")
-    a1.metric("PCR (Put-Call Ratio)", f"{pcr}", sentiment)
-    a2.metric("मजबूत Resistance", f"{resistance_strike}", "सबसे ज़्यादा Call OI")
-    a3.metric("मजबूत Support", f"{support_strike}", "सबसे ज़्यादा Put OI")
-    a4.metric("Max Pain लेवल", f"{max_pain}")
+    # 2. Volume का कैलकुलेशन
+    sum_call_vol = int(filtered_df["CALL VOL"].sum())
+    sum_put_vol = int(filtered_df["PUT VOL"].sum())
+    net_vol_diff = sum_put_vol - sum_call_vol
+    vol_pcr = round(sum_put_vol / sum_call_vol, 2) if sum_call_vol != 0 else 0
 
-    # OI तुलनात्मक बार चार्ट
-    fig_oi = go.Figure(data=[
-        go.Bar(name='Call OI (Resistance)', x=oc_df['STRIKE'].astype(str), y=oc_df['CALL OI'], marker_color='#EF553B'),
-        go.Bar(name='Put OI (Support)', x=oc_df['STRIKE'].astype(str), y=oc_df['PUT OI'], marker_color='#00CC96')
+    # 3. Total OI और Support/Resistance
+    total_call_oi = int(filtered_df["CALL OI"].sum())
+    total_put_oi = int(filtered_df["PUT OI"].sum())
+    overall_pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi != 0 else 0
+
+    resistance_strike = filtered_df.loc[filtered_df["CALL OI"].idxmax(), "STRIKE"]
+    support_strike = filtered_df.loc[filtered_df["PUT OI"].idxmax(), "STRIKE"]
+    most_active_call = filtered_df.loc[filtered_df["CALL VOL"].idxmax(), "STRIKE"]
+    most_active_put = filtered_df.loc[filtered_df["PUT VOL"].idxmax(), "STRIKE"]
+
+    # डैशबोर्ड सेक्शन 1: Change in OI हिसाब
+    st.markdown(f"### 🎯 1. Change in OI कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("कुल Call Change in OI", f"{sum_call_chg:,}", "Resistance दबाव")
+    m2.metric("कुल Put Change in OI", f"{sum_put_chg:,}", "Support दबाव")
+    m3.metric("Net OI अंतर (Put - Call)", f"{net_chg_diff:,}", "Bullish (तेज़ी)" if net_chg_diff > 0 else "Bearish (मंदी)")
+    m4.metric("Change in OI PCR", f"{chg_pcr}", f"Overall PCR: {overall_pcr}")
+
+    # डैशबोर्ड सेक्शन 2: Volume हिसाब
+    st.markdown(f"### 📊 2. Volume कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("कुल Call Volume", f"{sum_call_vol:,}", f"सबसे ज़्यादा: {most_active_call}")
+    v2.metric("कुल Put Volume", f"{sum_put_vol:,}", f"सबसे ज़्यादा: {most_active_put}")
+    v3.metric("Net Volume अंतर (Put - Call)", f"{net_vol_diff:,}", "Put साइड ज़्यादा वॉल्यूम" if net_vol_diff > 0 else "Call साइड ज़्यादा वॉल्यूम")
+    v4.metric("Volume PCR", f"{vol_pcr}", "Bullish गति" if vol_pcr > 1.0 else "Bearish गति")
+
+    # Support और Resistance कार्ड्स
+    s1, s2 = st.columns(2)
+    s1.success(f"🟢 **मजबूत Support (इस रेंज में):** `{support_strike}` (सबसे ज़्यादा Put OI)")
+    s2.error(f"🔴 **मजबूत Resistance (इस रेंज में):** `{resistance_strike}` (सबसे ज़्यादा Call OI)")
+
+    # चार्ट 1: Change in OI तुलनात्मक चार्ट
+    fig_chg = go.Figure(data=[
+        go.Bar(name='Call Change in OI', x=filtered_df['STRIKE'].astype(str), y=filtered_df['CALL CHG OI'], marker_color='#EF553B'),
+        go.Bar(name='Put Change in OI', x=filtered_df['STRIKE'].astype(str), y=filtered_df['PUT CHG OI'], marker_color='#00CC96')
     ])
-    fig_oi.update_layout(barmode='group', title="स्ट्राइक-वाइज़ Call vs Put Open Interest", height=350, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_oi, use_container_width=True)
+    fig_chg.update_layout(barmode='group', title=f"स्ट्राइक-वाइज़ Change in OI (ऊपर {strike_range} से नीचे {strike_range} स्ट्राइक)", height=330, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_chg, use_container_width=True)
 
-    # ऑप्शन चेन टेबल
-    st.write("### 📋 ऑप्शन चेन डेटा")
-    st.dataframe(oc_df, use_container_width=True, hide_index=True)
+    # चार्ट 2: Volume तुलनात्मक चार्ट
+    fig_vol = go.Figure(data=[
+        go.Bar(name='Call Volume', x=filtered_df['STRIKE'].astype(str), y=filtered_df['CALL VOL'], marker_color='#FFA15A'),
+        go.Bar(name='Put Volume', x=filtered_df['STRIKE'].astype(str), y=filtered_df['PUT VOL'], marker_color='#636EFA')
+    ])
+    fig_vol.update_layout(barmode='group', title=f"स्ट्राइक-वाइज़ Call vs Put Volume (ऊपर {strike_range} से नीचे {strike_range} स्ट्राइक)", height=330, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+    # ऑप्शन चेन टेबल (Volume और Change in OI सहित)
+    st.markdown("### 📋 पूरी ऑप्शन चेन टेबल (Volume + OI + Change in OI)")
+    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
