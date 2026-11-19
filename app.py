@@ -3,20 +3,201 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import requests
+import pyotp
 from datetime import datetime
 import pytz
 
 # पेज सेटिंग्स (Option Seller Edition)
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
-st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (Option Seller Pro)")
+st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (Angel One Auto-Live)")
 
-# दो मुख्य टैब: लाइव सेलर चेन और 10:00 AM Change in OI बैकटेस्टिंग
-tab1, tab2 = st.tabs(["⛓️ ऑप्शन सेलर लाइव चेन (1-Min Auto)", "📊 10:00 AM Chg OI (₹2000/Lot SL)"])
+# ==========================================
+# Angel One SmartAPI हेल्पर फंक्शन
+# ==========================================
+@st.cache_data(ttl=3600)
+def get_angel_scrip_master():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    res = requests.get(url, timeout=15)
+    return pd.DataFrame(res.json())
+
+def angel_login(api_key, client_id, mpin, totp_secret):
+    try:
+        totp = pyotp.TOTP(totp_secret.strip().replace(" ", "")).now()
+        url = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-UserType": "USER",
+            "X-SourceID": "WEB",
+            "X-ClientLocalIP": "127.0.0.1",
+            "X-ClientPublicIP": "127.0.0.1",
+            "X-MACAddress": "00:00:00:00:00:00",
+            "X-PrivateKey": api_key.strip()
+        }
+        payload = {
+            "clientcode": client_id.strip(),
+            "password": mpin.strip(),
+            "totp": totp
+        }
+        res = requests.post(url, json=payload, headers=headers, timeout=10).json()
+        if res.get("status") and res.get("data", {}).get("jwtToken"):
+            return res["data"]["jwtToken"], None
+        return None, res.get("message", "लॉगिन विफल रहा। अपनी डिटेल्स चेक करें।")
+    except Exception as e:
+        return None, f"लॉगिन एरर: {str(e)}"
+
+# ==========================================
+# AUTO-LOGIN: Secrets से अपने आप लॉगिन करना
+# ==========================================
+if "angel_jwt" not in st.session_state:
+    try:
+        if "ANGEL_API_KEY" in st.secrets and "ANGEL_CLIENT_ID" in st.secrets:
+            jwt, err = angel_login(
+                st.secrets["ANGEL_API_KEY"],
+                st.secrets["ANGEL_CLIENT_ID"],
+                st.secrets["ANGEL_MPIN"],
+                st.secrets["ANGEL_TOTP"]
+            )
+            if jwt:
+                st.session_state["angel_jwt"] = jwt
+                st.session_state["angel_key"] = st.secrets["ANGEL_API_KEY"]
+    except Exception:
+        pass
+
+def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "X-PrivateKey": api_key.strip()
+    }
+    quote_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
+
+    idx_info = {
+        "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50},
+        "Bank Nifty": {"exch": "NSE", "token": "99926009", "name": "BANKNIFTY", "opt_exch": "NFO", "step": 100},
+        "Sensex": {"exch": "BSE", "token": "99919000", "name": "SENSEX", "opt_exch": "BFO", "step": 100}
+    }[selected_idx]
+
+    spot_payload = {"mode": "LTP", "exchangeTokens": {idx_info["exch"]: [idx_info["token"]]}}
+    spot_res = requests.post(quote_url, json=spot_payload, headers=headers, timeout=10).json()
+    if not spot_res.get("status"):
+        return None, None, None, f"Angel API Error: {spot_res.get('message', 'Token Expired')}"
+
+    spot_price = float(spot_res["data"]["fetched"][0]["ltp"])
+    step = idx_info["step"]
+    atm_strike = round(spot_price / step) * step
+
+    master_df = get_angel_scrip_master()
+    opt_df = master_df[
+        (master_df["name"] == idx_info["name"]) & 
+        (master_df["exch_seg"] == idx_info["opt_exch"]) &
+        (master_df["instrumenttype"].isin(["OPTIDX"]))
+    ].copy()
+
+    if opt_df.empty:
+        return None, None, None, "ऑप्शन कॉन्ट्रैक्ट लिस्ट नहीं मिली।"
+
+    opt_df["expiry_dt"] = pd.to_datetime(opt_df["expiry"], format="%d%b%Y", errors="coerce")
+    opt_df = opt_df.dropna(subset=["expiry_dt"])
+    today = pd.Timestamp.now().normalize()
+    future_expiries = sorted(opt_df[opt_df["expiry_dt"] >= today]["expiry_dt"].unique())
+    if not future_expiries:
+        return None, None, None, "कोई सक्रिय एक्सपायरी नहीं मिली।"
+
+    nearest_exp = future_expiries[0]
+    exp_str = pd.Timestamp(nearest_exp).strftime("%d-%b-%Y")
+    exp_df = opt_df[opt_df["expiry_dt"] == nearest_exp].copy()
+
+    exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
+    exp_df["opt_type"] = exp_df["symbol"].str[-2:]
+
+    min_s = atm_strike - (s_range * step)
+    max_s = atm_strike + (s_range * step)
+    target_df = exp_df[(exp_df["clean_strike"] >= min_s) & (exp_df["clean_strike"] <= max_s)].copy()
+
+    tokens = target_df["token"].astype(str).tolist()
+    if not tokens:
+        return None, None, None, "चुनी गई स्ट्राइक रेंज के टोकन नहीं मिले।"
+
+    full_payload = {"mode": "FULL", "exchangeTokens": {idx_info["opt_exch"]: tokens[:50]}}
+    q_res = requests.post(quote_url, json=full_payload, headers=headers, timeout=10).json()
+    if not q_res.get("status"):
+        return None, None, None, "ऑप्शन कोट्स लाने में समस्या आई।"
+
+    fetched_map = {str(item["symbolToken"]): item for item in q_res["data"]["fetched"]}
+    strikes_list = sorted(target_df["clean_strike"].unique())
+
+    rows = []
+    for st_val in strikes_list:
+        ce_row = target_df[(target_df["clean_strike"] == st_val) & (target_df["opt_type"] == "CE")]
+        pe_row = target_df[(target_df["clean_strike"] == st_val) & (target_df["opt_type"] == "PE")]
+
+        ce_q = fetched_map.get(str(ce_row["token"].values[0]), {}) if not ce_row.empty else {}
+        pe_q = fetched_map.get(str(pe_row["token"].values[0]), {}) if not pe_row.empty else {}
+
+        ce_oi = int(ce_q.get("opnInterest", 0))
+        ce_chg_oi = int(ce_q.get("netChangeOpnInterest", 0)) if "netChangeOpnInterest" in ce_q else 0
+
+        pe_oi = int(pe_q.get("opnInterest", 0))
+        pe_chg_oi = int(pe_q.get("netChangeOpnInterest", 0)) if "netChangeOpnInterest" in pe_q else 0
+
+        rows.append({
+            "CALL VOL": int(ce_q.get("tradeVolume", 0)),
+            "CALL CHG OI": ce_chg_oi,
+            "CALL OI": ce_oi,
+            "CALL LTP": float(ce_q.get("ltp", 0.0)),
+            "STRIKE": st_val,
+            "PUT LTP": float(pe_q.get("ltp", 0.0)),
+            "PUT OI": pe_oi,
+            "PUT CHG OI": pe_chg_oi,
+            "PUT VOL": int(pe_q.get("tradeVolume", 0))
+        })
+
+    return pd.DataFrame(rows), spot_price, exp_str, None
+
+# दो मुख्य टैब
+tab1, tab2 = st.tabs(["⛓️ ऑप्शन सेलर लाइव चेन (Angel One Live)", "📊 10:00 AM Chg OI (₹2000/Lot SL)"])
 
 # ==========================================
 # TAB 1: ऑप्शन सेलर लाइव ऑप्शन चेन और सिग्नल
 # ==========================================
 with tab1:
+    is_connected = "angel_jwt" in st.session_state
+    with st.expander("🔑 Angel One SmartAPI कनेक्शन (Auto-Login सेटअप)", expanded=not is_connected):
+        if is_connected:
+            st.success("✅ Angel One ऑटो-कनेक्टेड है! अब आपको रोज़ डिटेल डालने की ज़रूरत नहीं है।")
+        else:
+            st.info("💡 रोज़ डिटेल डालने से बचने के लिए Streamlit Settings -> Secrets में अपनी डिटेल सेव करें, या नीचे मैनुअल भरें:")
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                angel_api_key = st.text_input("API Key", type="password", placeholder="SmartAPI Key")
+            with a2:
+                angel_client_id = st.text_input("Client ID", placeholder="जैसे A123456")
+            with a3:
+                angel_mpin = st.text_input("MPIN", type="password", placeholder="4-अंकों का PIN")
+            with a4:
+                angel_totp = st.text_input("TOTP Secret Key", type="password", placeholder="Authenticator Secret")
+
+            if st.button("🔗 Angel One से कनेक्ट करें", use_container_width=True):
+                if angel_api_key and angel_client_id and angel_mpin and angel_totp:
+                    with st.spinner("Angel One SmartAPI से जुड़ रहा है..."):
+                        jwt, err = angel_login(angel_api_key, angel_client_id, angel_mpin, angel_totp)
+                        if jwt:
+                            st.session_state["angel_jwt"] = jwt
+                            st.session_state["angel_key"] = angel_api_key
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {err}")
+                else:
+                    st.warning("कृपया चारों बॉक्स भरें।")
+
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
         idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty", "Sensex"], key="live_idx")
@@ -39,48 +220,75 @@ with tab1:
         else:
             sym, step, default_spot, hedge_pts = "^BSESN", 100, 79000.0, 1000
 
-        spot_data = yf.download(sym, period="1d", interval="1m", progress=False)
-        if isinstance(spot_data.columns, pd.MultiIndex):
-            spot_data.columns = spot_data.columns.get_level_values(0)
-        spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
+        is_live = False
+        expiry_label = "Simulation"
+        filtered_df = None
+        spot_price = default_spot
+
+        if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+            live_df, live_spot, exp_date, err_msg = fetch_angel_live_oc(
+                st.session_state["angel_jwt"], st.session_state["angel_key"], selected_idx, s_range
+            )
+            if err_msg:
+                # अगर सेशन एक्सपायर हो जाए तो Secrets से दोबारा ऑटो-लॉगिन करना
+                if "ANGEL_API_KEY" in st.secrets:
+                    new_jwt, _ = angel_login(
+                        st.secrets["ANGEL_API_KEY"], st.secrets["ANGEL_CLIENT_ID"],
+                        st.secrets["ANGEL_MPIN"], st.secrets["ANGEL_TOTP"]
+                    )
+                    if new_jwt:
+                        st.session_state["angel_jwt"] = new_jwt
+                        live_df, live_spot, exp_date, err_msg = fetch_angel_live_oc(
+                            new_jwt, st.session_state["angel_key"], selected_idx, s_range
+                        )
+                if err_msg:
+                    st.error(f"⚠️ {err_msg}")
+
+            if live_df is not None and not live_df.empty:
+                filtered_df = live_df
+                spot_price = live_spot
+                expiry_label = exp_date
+                is_live = True
+
+        if not is_live:
+            spot_data = yf.download(sym, period="1d", interval="1m", progress=False)
+            if isinstance(spot_data.columns, pd.MultiIndex):
+                spot_data.columns = spot_data.columns.get_level_values(0)
+            spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
+            atm_temp = round(spot_price / step) * step
+
+            minute_seed = int(datetime.now(ist).strftime("%H%M")) + int(atm_temp)
+            np.random.seed(minute_seed)
+
+            all_strikes = [atm_temp + (i * step) for i in range(-10, 11)]
+            call_oi = [int(np.random.randint(25, 98) * 1000 * (1.4 if s > atm_temp else 0.7)) for s in all_strikes]
+            put_oi = [int(np.random.randint(25, 98) * 1000 * (1.4 if s < atm_temp else 0.7)) for s in all_strikes]
+            call_chg_oi = [int(np.random.randint(-9, 28) * 1000 * (1.3 if s >= atm_temp else 0.6)) for s in all_strikes]
+            put_chg_oi = [int(np.random.randint(-9, 28) * 1000 * (1.3 if s <= atm_temp else 0.6)) for s in all_strikes]
+            call_vol = [int(np.random.randint(90, 480) * 1000 * (1.5 if abs(s - atm_temp) <= 2*step else 0.7)) for s in all_strikes]
+            put_vol = [int(np.random.randint(90, 480) * 1000 * (1.5 if abs(s - atm_temp) <= 2*step else 0.7)) for s in all_strikes]
+            call_ltp = [max(5.0, round((spot_price - s) + np.random.uniform(35, 115), 1)) for s in all_strikes]
+            put_ltp = [max(5.0, round((s - spot_price) + np.random.uniform(35, 115), 1)) for s in all_strikes]
+
+            full_df = pd.DataFrame({
+                "CALL VOL": call_vol, "CALL CHG OI": call_chg_oi, "CALL OI": call_oi, "CALL LTP": call_ltp,
+                "STRIKE": all_strikes,
+                "PUT LTP": put_ltp, "PUT OI": put_oi, "PUT CHG OI": put_chg_oi, "PUT VOL": put_vol
+            })
+            min_s = atm_temp - (s_range * step)
+            max_s = atm_temp + (s_range * step)
+            filtered_df = full_df[(full_df["STRIKE"] >= min_s) & (full_df["STRIKE"] <= max_s)].copy()
+
         atm_strike = round(spot_price / step) * step
-
-        minute_seed = int(datetime.now(ist).strftime("%H%M")) + int(atm_strike)
-        np.random.seed(minute_seed)
-
-        all_strikes = [atm_strike + (i * step) for i in range(-10, 11)]
-        call_oi = [int(np.random.randint(25, 98) * 1000 * (1.4 if s > atm_strike else 0.7)) for s in all_strikes]
-        put_oi = [int(np.random.randint(25, 98) * 1000 * (1.4 if s < atm_strike else 0.7)) for s in all_strikes]
-        
-        call_chg_oi = [int(np.random.randint(-9, 28) * 1000 * (1.3 if s >= atm_strike else 0.6)) for s in all_strikes]
-        put_chg_oi = [int(np.random.randint(-9, 28) * 1000 * (1.3 if s <= atm_strike else 0.6)) for s in all_strikes]
-
-        call_vol = [int(np.random.randint(90, 480) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
-        put_vol = [int(np.random.randint(90, 480) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
-        
-        call_ltp = [max(5.0, round((spot_price - s) + np.random.uniform(35, 115), 1)) for s in all_strikes]
-        put_ltp = [max(5.0, round((s - spot_price) + np.random.uniform(35, 115), 1)) for s in all_strikes]
-
-        full_df = pd.DataFrame({
-            "CALL VOL": call_vol,
-            "CALL CHG OI": call_chg_oi,
-            "CALL OI": call_oi,
-            "CALL LTP": call_ltp,
-            "STRIKE": all_strikes,
-            "PUT LTP": put_ltp,
-            "PUT OI": put_oi,
-            "PUT CHG OI": put_chg_oi,
-            "PUT VOL": put_vol
-        })
-
-        min_s = atm_strike - (s_range * step)
-        max_s = atm_strike + (s_range * step)
-        filtered_df = full_df[(full_df["STRIKE"] >= min_s) & (full_df["STRIKE"] <= max_s)].copy()
 
         sum_call_chg = int(filtered_df["CALL CHG OI"].sum())
         sum_put_chg = int(filtered_df["PUT CHG OI"].sum())
-        net_writing_diff = sum_put_chg - sum_call_chg
-        chg_pcr = round(sum_put_chg / sum_call_chg, 2) if sum_call_chg != 0 else 0
+        if sum_call_chg == 0 and sum_put_chg == 0:
+            net_writing_diff = int(filtered_df["PUT OI"].sum() - filtered_df["CALL OI"].sum())
+        else:
+            net_writing_diff = sum_put_chg - sum_call_chg
+
+        chg_pcr = round(sum_put_chg / sum_call_chg, 2) if sum_call_chg != 0 else round(filtered_df["PUT OI"].sum() / max(1, filtered_df["CALL OI"].sum()), 2)
 
         sum_call_vol = int(filtered_df["CALL VOL"].sum())
         sum_put_vol = int(filtered_df["PUT VOL"].sum())
@@ -95,16 +303,17 @@ with tab1:
         atm_row = filtered_df[filtered_df["STRIKE"] == atm_strike]
         atm_straddle_prem = float(atm_row["CALL LTP"].values[0] + atm_row["PUT LTP"].values[0]) if not atm_row.empty else 0.0
 
-        st.caption(f"⏱️ **आखिरी अपडेट (IST):** `{now_str}` (हर 60 सेकंड में ऑटो-रिफ्रेश चालू) | 💰 **ATM Straddle कुल प्रीमियम:** `₹{atm_straddle_prem:.1f}` | 🛡️ **Hedge दूरी:** `{hedge_pts} पॉइंट` | 🛑 **SL:** `₹2,000 / लॉट`")
+        data_badge = f"🟢 **ANGEL ONE LIVE DATA (Expiry: {expiry_label})**" if is_live else "🟡 **DEMO MODE (असली डेटा के लिए ऊपर Angel One कनेक्ट करें)**"
+        st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 💰 **ATM Straddle:** `₹{atm_straddle_prem:.1f}` | 🛡️ **Hedge:** `{hedge_pts} pts` | 🛑 **SL:** `₹2,000/Lot`")
 
-        if net_writing_diff > 15000 and vol_pcr >= 1.05:
+        if net_writing_diff > 0 and vol_pcr >= 1.0:
             sig_bg = "linear-gradient(90deg, #0f5132, #198754)"
             sig_title = f"🟢 SELLER SIGNAL: ATM {atm_strike} PE Sell + {atm_strike - hedge_pts} PE Buy (SL: ₹2,000/Lot)"
-            sig_desc = f"नीचे के लेवल पर भारी Put Writing हो रही है (Net Put Chg OI: +{net_writing_diff:,})। ATM PE बेचकर {hedge_pts} पॉइंट नीचे हेज करें।"
-        elif net_writing_diff < -15000 and vol_pcr <= 0.95:
+            sig_desc = f"नीचे के लेवल पर भारी Put Writing हो रही है (Net Put दबाव: +{net_writing_diff:,})। ATM PE बेचकर {hedge_pts} पॉइंट नीचे हेज करें।"
+        elif net_writing_diff < 0 and vol_pcr < 1.0:
             sig_bg = "linear-gradient(90deg, #842029, #dc3545)"
             sig_title = f"🔴 SELLER SIGNAL: ATM {atm_strike} CE Sell + {atm_strike + hedge_pts} CE Buy (SL: ₹2,000/Lot)"
-            sig_desc = f"ऊपर के लेवल पर भारी Call Writing हो रही है (Net Call Chg OI: {abs(net_writing_diff):,})। ATM CE बेचकर {hedge_pts} पॉइंट ऊपर हेज करें।"
+            sig_desc = f"ऊपर के लेवल पर भारी Call Writing हो रही है (Net Call दबाव: {abs(net_writing_diff):,})। ATM CE बेचकर {hedge_pts} पॉइंट ऊपर हेज करें।"
         else:
             sig_bg = "linear-gradient(90deg, #4a148c, #7b1fa2)"
             sig_title = f"🟣 SELLER SIGNAL: IRON FLY / STRANGLE ({atm_strike} ATM पर दोनों तरफ दबाव बराबर)"
@@ -122,7 +331,7 @@ with tab1:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("कुल Call Writing (Chg OI)", f"{sum_call_chg:,}", f"ताज़ा दबाव: {fresh_call_writing_strike} CE")
         m2.metric("कुल Put Writing (Chg OI)", f"{sum_put_chg:,}", f"ताज़ा सपोर्ट: {fresh_put_writing_strike} PE")
-        m3.metric("Net Writing अंतर (Put - Call)", f"{net_writing_diff:,}", f"Chg OI PCR: {chg_pcr}")
+        m3.metric("Net Writing अंतर (Put - Call)", f"{net_writing_diff:,}", f"OI PCR: {chg_pcr}")
         m4.metric("कुल Volume (Call / Put)", f"{sum_call_vol//1000}K / {sum_put_vol//1000}K", f"Vol PCR: {vol_pcr}")
 
         def style_seller_chain(row):
@@ -231,7 +440,6 @@ with tab2:
                 trade_logs = []
 
                 total_qty = lot_qty * lots
-                # प्रति लॉट ₹2,000 के हिसाब से पॉइंट्स में SL सीमा (लॉट बदलने पर भी पॉइंट्स समान रहेंगे)
                 sl_points_limit = sl_per_lot / lot_qty
 
                 for dt, day_df in intraday.groupby('Date'):
