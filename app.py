@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 import pytz
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
-st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (Paper + Live Algo)")
+st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
 
 # ==========================================
-# Session State इनिशियलाइज़ेशन (Paper & Live Algo)
+# Session State इनिशियलाइज़ेशन
 # ==========================================
 if "paper_capital" not in st.session_state:
     st.session_state["paper_capital"] = 200000.0
@@ -23,6 +23,67 @@ if "trade_history" not in st.session_state:
     st.session_state["trade_history"] = []
 if "auto_traded_date" not in st.session_state:
     st.session_state["auto_traded_date"] = ""
+if "last_tg_update_id" not in st.session_state:
+    st.session_state["last_tg_update_id"] = 0
+
+# ==========================================
+# Telegram Alert और Remote Command फंक्शन्स
+# ==========================================
+def send_telegram_alert(message_text):
+    """Telegram पर तुरंत ट्रेड और SL अलर्ट भेजना"""
+    try:
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "").strip()
+        chat_id = str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
+        if not bot_token or not chat_id:
+            return False, "Telegram Secrets सेव नहीं हैं।"
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message_text,
+            "parse_mode": "HTML"
+        }
+        res = requests.post(url, json=payload, timeout=8).json()
+        if res.get("ok"):
+            return True, "Sent"
+        return False, res.get("description", "Telegram Error")
+    except Exception as e:
+        return False, str(e)
+
+def check_telegram_commands():
+    """Telegram से भेजे गए /exit या /status कमांड पढ़ना"""
+    try:
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "").strip()
+        allowed_chat_id = str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
+        if not bot_token or not allowed_chat_id:
+            return None
+
+        url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+        params = {"offset": st.session_state["last_tg_update_id"] + 1, "timeout": 2}
+        res = requests.get(url, params=params, timeout=5).json()
+
+        if not res.get("ok"):
+            return None
+
+        detected_cmd = None
+        for update in res.get("result", []):
+            upd_id = update.get("update_id", 0)
+            if upd_id > st.session_state["last_tg_update_id"]:
+                st.session_state["last_tg_update_id"] = upd_id
+
+            msg = update.get("message", {})
+            sender_id = str(msg.get("chat", {}).get("id", ""))
+            text = msg.get("text", "").strip().upper()
+
+            # केवल आपके अपने Chat ID से आए कमांड ही स्वीकार करें (सुरक्षा के लिए)
+            if sender_id == allowed_chat_id:
+                if text in ["/EXIT", "EXIT", "STOP", "CLOSE"]:
+                    detected_cmd = "EXIT"
+                elif text in ["/STATUS", "STATUS", "MTM", "PNL"]:
+                    detected_cmd = "STATUS"
+        return detected_cmd
+    except Exception:
+        return None
 
 # ==========================================
 # Angel One SmartAPI हेल्पर फंक्शन्स
@@ -75,7 +136,6 @@ if "angel_jwt" not in st.session_state:
         pass
 
 def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token, transaction_type, quantity):
-    """Angel One SmartAPI पर असली मार्केट ऑर्डर भेजना"""
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder"
     headers = {
         "Authorization": f"Bearer {jwt_token}",
@@ -111,7 +171,6 @@ def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token
         return False, str(e)
 
 def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens):
-    """चालू पोजीशन के लिए ताज़ा LTP लाना"""
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
     headers = {
         "Authorization": f"Bearer {jwt_token}",
@@ -186,7 +245,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
     exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
-    # हेज स्ट्राइक (1000 पॉइंट तक) के टोकन भी शामिल करने के लिए रेंज थोड़ी बड़ी रखें
     max_hedge = 1000 if selected_idx == "Sensex" else 300
     fetch_span = max(s_range * step, max_hedge + step)
     min_s = atm_strike - fetch_span
@@ -197,7 +255,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     if not tokens:
         return None, None, None, {}, "चुनी गई स्ट्राइक रेंज के टोकन नहीं मिले।"
 
-    # हर स्ट्राइक के सिंबल और टोकन का मैप बनाना (ऑर्डर लगाने के लिए)
     contract_map = {}
     for _, r in target_df.iterrows():
         contract_map[(int(r["clean_strike"]), r["opt_type"])] = {
@@ -206,7 +263,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
             "exch": idx_info["opt_exch"]
         }
 
-    # FULL मोड में कोट्स लाना (50 टोकन प्रति बैच)
     fetched_map = {}
     for i in range(0, len(tokens), 50):
         batch = tokens[i:i+50]
@@ -248,8 +304,7 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
     return pd.DataFrame(rows), spot_price, exp_str, contract_map, None
 
-def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell_ltp, buy_ltp, lots, lot_qty, contract_map):
-    """पहले Hedge Buy और फिर ATM Sell एग्जीक्यूट करना (Paper या Live)"""
+def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell_ltp, buy_ltp, lots, lot_qty, contract_map, trigger_src="Manual"):
     ist = pytz.timezone('Asia/Kolkata')
     now_str = datetime.now(ist).strftime("%I:%M:%S %p")
     total_qty = lots * lot_qty
@@ -264,20 +319,20 @@ def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell
         jwt = st.session_state["angel_jwt"]
         akey = st.session_state["angel_key"]
 
-        # 1. पहले Hedge Buy ऑर्डर (मार्जिन बेनिफिट के लिए)
         ok_buy, msg_buy = place_angel_order(jwt, akey, buy_c["exch"], buy_c["symbol"], buy_c["token"], "BUY", total_qty)
         if not ok_buy:
+            send_telegram_alert(f"⚠️ <b>ORDER REJECTED ({selected_idx})</b>\nHedge Buy विफल: {msg_buy}")
             return False, f"Hedge Buy ऑर्डर विफल: {msg_buy}"
 
         time.sleep(0.5)
 
-        # 2. फिर ATM Sell ऑर्डर
         ok_sell, msg_sell = place_angel_order(jwt, akey, sell_c["exch"], sell_c["symbol"], sell_c["token"], "SELL", total_qty)
         if not ok_sell:
-            # अगर Sell रिजेक्ट हो जाए तो सुरक्षा के लिए Hedge Buy तुरंत वापस काट दें
             place_angel_order(jwt, akey, buy_c["exch"], buy_c["symbol"], buy_c["token"], "SELL", total_qty)
+            send_telegram_alert(f"⚠️ <b>ATM SELL REJECTED ({selected_idx})</b>\nHedge सुरक्षित काट दिया गया: {msg_sell}")
             return False, f"ATM Sell रिजेक्ट हुआ (Hedge भी सुरक्षित काट दिया गया): {msg_sell}"
 
+    sl_limit = 2000.0 * lots
     st.session_state["active_trade"] = {
         "mode": mode,
         "index": selected_idx,
@@ -294,12 +349,25 @@ def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell
         "sell_entry": sell_ltp,
         "buy_entry": buy_ltp,
         "entry_time": now_str,
-        "sl_rs": 2000.0 * lots
+        "sl_rs": sl_limit
     }
+
+    mode_tag = "🟡 PAPER TRADE" if "PAPER" in mode else "🔴 LIVE ALGO TRADE"
+    spread_type = "Bull Put Spread" if side == "PE" else "Bear Call Spread"
+    tg_msg = (
+        f"🚀 <b>{mode_tag} EXECUTED ({trigger_src})</b>\n"
+        f"📊 <b>Index:</b> {selected_idx} ({spread_type})\n"
+        f"🛡️ <b>1. Hedge Buy:</b> {buy_strike} {side} @ ₹{buy_ltp}\n"
+        f"💰 <b>2. ATM Sell:</b> {sell_strike} {side} @ ₹{sell_ltp}\n"
+        f"📦 <b>Qty:</b> {lots} Lot ({total_qty} Qty)\n"
+        f"🛑 <b>Auto Stop-Loss:</b> -₹{int(sl_limit):,}\n"
+        f"⏰ <b>Time:</b> {now_str}\n\n"
+        f"💡 <i>पोजीशन बंद करने के लिए <b>/exit</b> और लाइव प्रॉफिट देखने के लिए <b>/status</b> भेजें।</i>"
+    )
+    send_telegram_alert(tg_msg)
     return True, f"सफल! पहले {buy_strike} {side} Buy और फिर {sell_strike} {side} Sell एग्जीक्यूट हुआ।"
 
 def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
-    """चालू पोजीशन को सुरक्षित तरीके से बंद करना (पहले Short Sell कवर, फिर Long Hedge Sell)"""
     tr = st.session_state["active_trade"]
     if not tr:
         return
@@ -310,10 +378,8 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
     if tr["mode"] == "🔴 LIVE ALGO (असली पैसा)" and "angel_jwt" in st.session_state:
         jwt = st.session_state["angel_jwt"]
         akey = st.session_state["angel_key"]
-        # 1. पहले बेची हुई ATM स्ट्राइक वापस खरीदें (BUY)
         place_angel_order(jwt, akey, tr["exch"], tr["sell_symbol"], tr["sell_token"], "BUY", tr["qty"])
         time.sleep(0.5)
-        # 2. फिर खरीदी हुई Hedge स्ट्राइक बेचें (SELL)
         place_angel_order(jwt, akey, tr["exch"], tr["buy_symbol"], tr["buy_token"], "SELL", tr["qty"])
 
     pnl_pts = (tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - tr["buy_entry"])
@@ -322,8 +388,9 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
     if tr["mode"] == "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)":
         st.session_state["paper_capital"] += pnl_rs
 
+    mode_short = "Paper" if "PAPER" in tr["mode"] else "LIVE"
     st.session_state["trade_history"].insert(0, {
-        "मोड": "Paper" if "PAPER" in tr["mode"] else "LIVE",
+        "मोड": mode_short,
         "इंडेक्स": tr["index"],
         "स्प्रेड": f"Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}",
         "लॉट": tr["lots"],
@@ -332,6 +399,17 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
         "कारण": reason,
         "लाभ / हानि (₹)": pnl_rs
     })
+
+    icon = "🛑" if "SL Hit" in reason else ("✅" if pnl_rs >= 0 else "⚠️")
+    tg_exit_msg = (
+        f"{icon} <b>TRADE CLOSED ({mode_short})</b>\n"
+        f"📊 <b>Index:</b> {tr['index']}\n"
+        f"📌 <b>Spread:</b> Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}\n"
+        f"📝 <b>Reason:</b> {reason}\n"
+        f"💵 <b>Final P&L:</b> <b>₹{pnl_rs:+,.0f}</b>\n"
+        f"⏰ <b>Exit Time:</b> {exit_time}"
+    )
+    send_telegram_alert(tg_exit_msg)
     st.session_state["active_trade"] = None
 
 def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
@@ -405,7 +483,22 @@ tab1, tab2, tab3 = st.tabs([
 with tab1:
     st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर")
 
-    m_col1, m_col2, m_col3 = st.columns([2, 1, 1])
+    has_tg = ("TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets)
+    t_col1, t_col2 = st.columns([3, 1])
+    with t_col1:
+        if has_tg:
+            st.success("📲 **2-Way Telegram कंट्रोल चालू है!** आप सीधे Telegram पर **`/exit`** भेजकर ट्रेड बंद कर सकते हैं और **`/status`** भेजकर लाइव MTM देख सकते हैं।")
+        else:
+            st.warning("📲 Telegram अलर्ट और `/exit` कंट्रोल चालू करने के लिए Streamlit Secrets में `TELEGRAM_BOT_TOKEN` और `TELEGRAM_CHAT_ID` जोड़ें।")
+    with t_col2:
+        if st.button("🔔 Test Telegram", use_container_width=True):
+            ok_tg, tg_err = send_telegram_alert("✅ <b>Test Alert:</b> आपका 2-Way Telegram कंट्रोल तैयार है! आप /status या /exit भेजकर टेस्ट कर सकते हैं।")
+            if ok_tg:
+                st.toast("Telegram पर टेस्ट मैसेज भेज दिया गया है!", icon="📲")
+            else:
+                st.error(f"Telegram Error: {tg_err}")
+
+    m_col1, m_col2, m3_col = st.columns([2, 1, 1])
     with m_col1:
         trade_mode = st.radio(
             "ट्रेडिंग मोड चुनें:",
@@ -414,7 +507,7 @@ with tab1:
         )
     with m_col2:
         algo_idx = st.selectbox("ट्रेडिंग इंडेक्स", ["Nifty 50", "Bank Nifty", "Sensex"], key="algo_idx")
-    with m_col3:
+    with m3_col:
         algo_lots = st.number_input("लॉट (Lots)", min_value=1, max_value=25, value=1, key="algo_lots")
 
     live_unlocked = True
@@ -434,6 +527,9 @@ with tab1:
         now_ist = datetime.now(ist)
         now_str = now_ist.strftime("%I:%M:%S %p")
         today_str = now_ist.strftime("%Y-%m-%d")
+
+        # हर रिफ्रेश पर Telegram से आए /exit या /status कमांड चेक करना
+        tg_cmd = check_telegram_commands()
 
         if selected_idx == "Nifty 50":
             sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 300, 75
@@ -475,7 +571,6 @@ with tab1:
 
         atm_strike = round(spot_price / step) * step
 
-        # ऊपर की 3 स्ट्राइक और नीचे की 3 स्ट्राइक का Change in OI नियम
         up_3_df = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3*step)]
         down_3_df = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3*step)]
 
@@ -502,11 +597,11 @@ with tab1:
         est_credit_rs = round((rec_sell_ltp - rec_buy_ltp) * lot_qty * lots_cnt, 0)
 
         # ==========================================
-        # 1. चालू पोजीशन (ACTIVE TRADE MONITOR & AUTO SL)
+        # 1. चालू पोजीशन (ACTIVE TRADE + TELEGRAM /exit & /status)
         # ==========================================
         active_tr = st.session_state["active_trade"]
         if active_tr is not None:
-            st.markdown("### 🔥 चालू पोजीशन (Live MTM & Auto Stop-Loss मॉनिटर)")
+            st.markdown("### 🔥 चालू पोजीशन (Live MTM & Telegram Remote Control)")
             curr_sell_ltp = active_tr["sell_entry"]
             curr_buy_ltp = active_tr["buy_entry"]
 
@@ -518,21 +613,33 @@ with tab1:
                 curr_sell_ltp = ltp_map.get(active_tr["sell_token"], curr_sell_ltp)
                 curr_buy_ltp = ltp_map.get(active_tr["buy_token"], curr_buy_ltp)
             else:
-                # पेपर मोड में अगर API ऑफलाइन हो तो हल्का लाइव बदलाव सिमुलेट करना
                 curr_sell_ltp = max(1.0, round(active_tr["sell_entry"] + np.random.uniform(-4, 4), 1))
                 curr_buy_ltp = max(1.0, round(active_tr["buy_entry"] + np.random.uniform(-2, 2), 1))
 
             live_pnl_pts = (active_tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - active_tr["buy_entry"])
             live_pnl_rs = round(live_pnl_pts * active_tr["qty"], 2)
 
-            # ऑटो Stop-Loss या 3:15 PM Auto Square-Off चेक
-            if live_pnl_rs <= -active_tr["sl_rs"]:
+            # अगर Telegram से /status कमांड आया हो
+            if tg_cmd == "STATUS":
+                send_telegram_alert(
+                    f"📊 <b>LIVE POSITION STATUS</b>\n"
+                    f"📌 <b>Spread:</b> Sell {active_tr['sell_strike']} {active_tr['side']} / Buy {active_tr['buy_strike']} {active_tr['side']}\n"
+                    f"💵 <b>Current MTM:</b> <b>₹{live_pnl_rs:+,.0f}</b>\n"
+                    f"🛑 <b>Auto SL:</b> -₹{int(active_tr['sl_rs']):,}"
+                )
+
+            # अगर Telegram से /exit कमांड आया हो
+            if tg_cmd == "EXIT":
+                close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Telegram /exit Command 📲")
+                st.warning("📲 Telegram से `/exit` कमांड मिला! पोजीशन बंद कर दी गई है।")
+                st.rerun()
+            elif live_pnl_rs <= -active_tr["sl_rs"]:
                 close_active_trade(curr_sell_ltp, curr_buy_ltp, reason=f"Auto SL Hit (-₹{int(active_tr['sl_rs'])})")
-                st.error(f"🛑 Stop-Loss हिट हुआ! पोजीशन अपने आप बंद कर दी गई।")
+                st.error("🛑 Stop-Loss हिट हुआ! पोजीशन बंद करके Telegram पर अलर्ट भेज दिया गया है।")
                 st.rerun()
             elif now_ist.hour == 15 and now_ist.minute >= 15:
                 close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="3:15 PM Auto Square-Off")
-                st.info("⏰ 3:15 PM हो गए! दिन के अंत में पोजीशन अपने आप बंद कर दी गई।")
+                st.info("⏰ 3:15 PM हो गए! पोजीशन बंद करके Telegram पर रिपोर्ट भेज दी गई है।")
                 st.rerun()
 
             p1, p2, p3, p4 = st.columns(4)
@@ -541,15 +648,25 @@ with tab1:
             p3.metric("खरीदी गई Hedge स्ट्राइक", f"{active_tr['buy_strike']} {active_tr['side']}", f"Entry: ₹{active_tr['buy_entry']} | Now: ₹{curr_buy_ltp}")
             p4.metric("लाइव MTM लाभ / हानि", f"₹{live_pnl_rs:+,.0f}", f"Auto SL: -₹{int(active_tr['sl_rs']):,}")
 
-            if st.button("🚨 पोजीशन अभी बंद करें (Square-Off Now)", type="primary", use_container_width=True):
-                close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Square-Off")
-                st.success("✅ पोजीशन बंद कर दी गई है।")
-                st.rerun()
+            b_exit1, b_exit2 = st.columns([3, 1])
+            with b_exit1:
+                if st.button("🚨 पोजीशन अभी बंद करें (Square-Off Now)", type="primary", use_container_width=True):
+                    close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Square-Off")
+                    st.success("✅ पोजीशन बंद कर दी गई है और Telegram अलर्ट भेज दिया गया है।")
+                    st.rerun()
+            with b_exit2:
+                if st.button("🔄 Check Telegram /exit", use_container_width=True):
+                    st.rerun()
 
         # ==========================================
         # 2. नई एंट्री कार्ड (1-CLICK / 10:00 AM AUTO)
         # ==========================================
         else:
+            if tg_cmd == "STATUS":
+                send_telegram_alert("ℹ️ <b>STATUS:</b> अभी कोई भी ट्रेड चालू नहीं है।")
+            elif tg_cmd == "EXIT":
+                send_telegram_alert("ℹ️ <b>EXIT:</b> बंद करने के लिए कोई चालू पोजीशन नहीं है।")
+
             st.markdown(f"""
             <div style="background: linear-gradient(90deg, #1e293b, #0f172a); padding: 16px; border-radius: 12px; border: 1px solid #334155; color: white; margin-bottom: 12px;">
                 <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
@@ -558,12 +675,11 @@ with tab1:
             </div>
             """, unsafe_allow_html=True)
 
-            # सुबह 10:00 AM ऑटो-एंट्री चेक (10:00 से 10:02 के बीच)
             if is_auto_10 and now_ist.hour == 10 and now_ist.minute <= 2 and st.session_state["auto_traded_date"] != today_str:
                 if "PAPER" in mode_sel or is_unlocked:
                     ok, msg = execute_spread_entry(
                         mode_sel, selected_idx, rec_side, rec_sell_strike, rec_buy_strike,
-                        rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map
+                        rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map, trigger_src="10:00 AM Auto"
                     )
                     if ok:
                         st.session_state["auto_traded_date"] = today_str
@@ -576,7 +692,7 @@ with tab1:
             if st.button(btn_label, disabled=btn_disabled, use_container_width=True):
                 ok, msg = execute_spread_entry(
                     mode_sel, selected_idx, rec_side, rec_sell_strike, rec_buy_strike,
-                    rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map
+                    rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map, trigger_src="1-Click"
                 )
                 if ok:
                     st.success(f"✅ {msg}")
@@ -585,7 +701,7 @@ with tab1:
                     st.error(f"❌ {msg}")
 
         # ==========================================
-        # 3. आज की ट्रेड बुक (Paper & Live History)
+        # 3. आज की ट्रेड बुक
         # ==========================================
         if st.session_state["trade_history"]:
             st.markdown("### 📜 ट्रेड बुक (Completed Trades)")
@@ -685,10 +801,6 @@ with tab2:
         min_s = atm_strike - (s_range * step)
         max_s = atm_strike + (s_range * step)
         filtered_df = full_df[(full_df["STRIKE"] >= min_s) & (full_df["STRIKE"] <= max_s)].copy()
-
-        sum_call_chg = int(filtered_df["CALL CHG OI"].sum())
-        sum_put_chg = int(filtered_df["PUT CHG OI"].sum())
-        net_writing_diff = (sum_put_chg - sum_call_chg) if (sum_call_chg != 0 or sum_put_chg != 0) else int(filtered_df["PUT OI"].sum() - filtered_df["CALL OI"].sum())
 
         safe_call_sell_strike = filtered_df.loc[filtered_df["CALL OI"].idxmax(), "STRIKE"]
         safe_put_sell_strike = filtered_df.loc[filtered_df["PUT OI"].idxmax(), "STRIKE"]
