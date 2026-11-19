@@ -19,7 +19,14 @@ with tab1:
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        symbol = st.selectbox("इंडेक्स / शेयर चुनें", ["^NSEI (Nifty 50)", "^NSEBANK (Bank Nifty)", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"])
+        symbol = st.selectbox("इंडेक्स / शेयर चुनें", [
+            "^NSEI (Nifty 50)", 
+            "^NSEBANK (Bank Nifty)", 
+            "^BSESN (Sensex)", 
+            "RELIANCE.NS", 
+            "TCS.NS", 
+            "HDFCBANK.NS"
+        ])
         ticker = symbol.split(" ")[0]
     with col2:
         period = st.selectbox("समय अवधि (Period)", ["3mo", "6mo", "1y", "2y"], index=2)
@@ -80,21 +87,26 @@ with tab2:
 
     c1, c2 = st.columns(2)
     with c1:
-        idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty"])
+        idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty", "Sensex"])
     with c2:
         strike_range = st.slider("ATM के ऊपर और नीचे कितनी स्ट्राइक जोड़ें?", min_value=1, max_value=10, value=5)
 
-    sym = "^NSEI" if idx == "Nifty 50" else "^NSEBANK"
-    step = 50 if idx == "Nifty 50" else 100
+    # इंडेक्स के हिसाब से सिंबल, स्ट्राइक गैप और डिफ़ॉल्ट प्राइस तय करना
+    if idx == "Nifty 50":
+        sym, step, default_spot = "^NSEI", 50, 24000.0
+    elif idx == "Bank Nifty":
+        sym, step, default_spot = "^NSEBANK", 100, 51000.0
+    else:  # Sensex
+        sym, step, default_spot = "^BSESN", 100, 79000.0
 
     # ताज़ा स्पॉट प्राइस लाना
     spot_data = yf.download(sym, period="5d", interval="1d", progress=False)
     if isinstance(spot_data.columns, pd.MultiIndex):
         spot_data.columns = spot_data.columns.get_level_values(0)
-    spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else (24000.0 if idx == "Nifty 50" else 51000.0)
+    spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
     atm_strike = round(spot_price / step) * step
 
-    st.info(f"📍 **स्पॉट प्राइस:** `{spot_price:,.2f}` | **ATM स्ट्राइक:** `{atm_strike}` | **चुनी गई रेंज:** `{atm_strike - strike_range*step}` से `{atm_strike + strike_range*step}` (ऊपर {strike_range} + ATM + नीचे {strike_range})")
+    st.info(f"📍 **{idx} स्पॉट प्राइस:** `{spot_price:,.2f}` | **ATM स्ट्राइक:** `{atm_strike}` | **चुनी गई रेंज:** `{atm_strike - strike_range*step}` से `{atm_strike + strike_range*step}` (ऊपर {strike_range} + ATM + नीचे {strike_range})")
 
     # कुल 10 स्ट्राइक ऊपर और 10 नीचे जनरेट करना
     all_strikes = [atm_strike + (i * step) for i in range(-10, 11)]
@@ -106,7 +118,6 @@ with tab2:
     call_chg_oi = [int(np.random.randint(-8, 25) * 1000 * (1.3 if s >= atm_strike else 0.6)) for s in all_strikes]
     put_chg_oi = [int(np.random.randint(-8, 25) * 1000 * (1.3 if s <= atm_strike else 0.6)) for s in all_strikes]
 
-    # Call और Put Volume (ATM के पास सबसे ज़्यादा ट्रेडिंग वॉल्यूम)
     call_vol = [int(np.random.randint(80, 450) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
     put_vol = [int(np.random.randint(80, 450) * 1000 * (1.5 if abs(s - atm_strike) <= 2*step else 0.7)) for s in all_strikes]
     
@@ -153,7 +164,7 @@ with tab2:
     most_active_put = filtered_df.loc[filtered_df["PUT VOL"].idxmax(), "STRIKE"]
 
     # डैशबोर्ड सेक्शन 1: Change in OI हिसाब
-    st.markdown(f"### 🎯 1. Change in OI कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
+    st.markdown(f"### 🎯 1. {idx} Change in OI कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("कुल Call Change in OI", f"{sum_call_chg:,}", "Resistance दबाव")
     m2.metric("कुल Put Change in OI", f"{sum_put_chg:,}", "Support दबाव")
@@ -161,7 +172,7 @@ with tab2:
     m4.metric("Change in OI PCR", f"{chg_pcr}", f"Overall PCR: {overall_pcr}")
 
     # डैशबोर्ड सेक्शन 2: Volume हिसाब
-    st.markdown(f"### 📊 2. Volume कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
+    st.markdown(f"### 📊 2. {idx} Volume कैलकुलेशन (ऊपर {strike_range} और नीचे {strike_range} स्ट्राइक)")
     v1, v2, v3, v4 = st.columns(4)
     v1.metric("कुल Call Volume", f"{sum_call_vol:,}", f"सबसे ज़्यादा: {most_active_call}")
     v2.metric("कुल Put Volume", f"{sum_put_vol:,}", f"सबसे ज़्यादा: {most_active_put}")
@@ -170,15 +181,15 @@ with tab2:
 
     # Support और Resistance कार्ड्स
     s1, s2 = st.columns(2)
-    s1.success(f"🟢 **मजबूत Support (इस रेंज में):** `{support_strike}` (सबसे ज़्यादा Put OI)")
-    s2.error(f"🔴 **मजबूत Resistance (इस रेंज में):** `{resistance_strike}` (सबसे ज़्यादा Call OI)")
+    s1.success(f"🟢 **मजबूत Support ({idx}):** `{support_strike}` (सबसे ज़्यादा Put OI)")
+    s2.error(f"🔴 **मजबूत Resistance ({idx}):** `{resistance_strike}` (सबसे ज़्यादा Call OI)")
 
     # चार्ट 1: Change in OI तुलनात्मक चार्ट
     fig_chg = go.Figure(data=[
         go.Bar(name='Call Change in OI', x=filtered_df['STRIKE'].astype(str), y=filtered_df['CALL CHG OI'], marker_color='#EF553B'),
         go.Bar(name='Put Change in OI', x=filtered_df['STRIKE'].astype(str), y=filtered_df['PUT CHG OI'], marker_color='#00CC96')
     ])
-    fig_chg.update_layout(barmode='group', title=f"स्ट्राइक-वाइज़ Change in OI (ऊपर {strike_range} से नीचे {strike_range} स्ट्राइक)", height=330, margin=dict(l=10, r=10, t=40, b=10))
+    fig_chg.update_layout(barmode='group', title=f"{idx} स्ट्राइक-वाइज़ Change in OI", height=330, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_chg, use_container_width=True)
 
     # चार्ट 2: Volume तुलनात्मक चार्ट
@@ -186,9 +197,9 @@ with tab2:
         go.Bar(name='Call Volume', x=filtered_df['STRIKE'].astype(str), y=filtered_df['CALL VOL'], marker_color='#FFA15A'),
         go.Bar(name='Put Volume', x=filtered_df['STRIKE'].astype(str), y=filtered_df['PUT VOL'], marker_color='#636EFA')
     ])
-    fig_vol.update_layout(barmode='group', title=f"स्ट्राइक-वाइज़ Call vs Put Volume (ऊपर {strike_range} से नीचे {strike_range} स्ट्राइक)", height=330, margin=dict(l=10, r=10, t=40, b=10))
+    fig_vol.update_layout(barmode='group', title=f"{idx} स्ट्राइक-वाइज़ Call vs Put Volume", height=330, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_vol, use_container_width=True)
 
     # ऑप्शन चेन टेबल (Volume और Change in OI सहित)
-    st.markdown("### 📋 पूरी ऑप्शन चेन टेबल (Volume + OI + Change in OI)")
+    st.markdown(f"### 📋 {idx} पूरी ऑप्शन चेन टेबल")
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
