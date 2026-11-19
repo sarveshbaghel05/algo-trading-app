@@ -43,7 +43,7 @@ def send_telegram_alert(message_text):
             "text": message_text,
             "parse_mode": "HTML"
         }
-        res = requests.post(url, json=payload, timeout=8).json()
+        res = requests.post(url, json=payload, timeout=5).json()
         if res.get("ok"):
             return True, "Sent"
         return False, res.get("description", "Telegram Error")
@@ -59,8 +59,8 @@ def check_telegram_commands():
             return None
 
         url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
-        params = {"offset": st.session_state["last_tg_update_id"] + 1, "timeout": 2}
-        res = requests.get(url, params=params, timeout=5).json()
+        params = {"offset": st.session_state["last_tg_update_id"] + 1, "timeout": 1}
+        res = requests.get(url, params=params, timeout=3).json()
 
         if not res.get("ok"):
             return None
@@ -75,7 +75,6 @@ def check_telegram_commands():
             sender_id = str(msg.get("chat", {}).get("id", ""))
             text = msg.get("text", "").strip().upper()
 
-            # केवल आपके अपने Chat ID से आए कमांड ही स्वीकार करें (सुरक्षा के लिए)
             if sender_id == allowed_chat_id:
                 if text in ["/EXIT", "EXIT", "STOP", "CLOSE"]:
                     detected_cmd = "EXIT"
@@ -170,7 +169,8 @@ def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token
     except Exception as e:
         return False, str(e)
 
-def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens):
+@st.cache_data(ttl=2)
+def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
     headers = {
         "Authorization": f"Bearer {jwt_token}",
@@ -183,15 +183,16 @@ def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens):
         "X-MACAddress": "00:00:00:00:00:00",
         "X-PrivateKey": api_key.strip()
     }
-    payload = {"mode": "LTP", "exchangeTokens": {exchange: [str(t) for t in tokens]}}
+    payload = {"mode": "LTP", "exchangeTokens": {exchange: [str(t) for t in tokens_tuple]}}
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10).json()
+        res = requests.post(url, json=payload, headers=headers, timeout=5).json()
         if res.get("status"):
             return {str(item["symbolToken"]): float(item["ltp"]) for item in res["data"]["fetched"]}
     except Exception:
         pass
     return {}
 
+@st.cache_data(ttl=2)
 def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     headers = {
         "Authorization": f"Bearer {jwt_token}",
@@ -212,12 +213,16 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
         "Sensex": {"exch": "BSE", "token": "99919000", "name": "SENSEX", "opt_exch": "BFO", "step": 100}
     }[selected_idx]
 
-    spot_payload = {"mode": "LTP", "exchangeTokens": {idx_info["exch"]: [idx_info["token"]]}}
-    spot_res = requests.post(quote_url, json=spot_payload, headers=headers, timeout=10).json()
-    if not spot_res.get("status"):
-        return None, None, None, {}, f"Angel API Error: {spot_res.get('message', 'Token Expired')}"
+    try:
+        spot_payload = {"mode": "LTP", "exchangeTokens": {idx_info["exch"]: [idx_info["token"]]}}
+        spot_res = requests.post(quote_url, json=spot_payload, headers=headers, timeout=5).json()
+        if not spot_res.get("status"):
+            return None, None, None, {}, f"Angel API Error: {spot_res.get('message', 'Token Expired')}"
 
-    spot_price = float(spot_res["data"]["fetched"][0]["ltp"])
+        spot_price = float(spot_res["data"]["fetched"][0]["ltp"])
+    except Exception as e:
+        return None, None, None, {}, f"Spot Fetch Error: {str(e)}"
+
     step = idx_info["step"]
     atm_strike = round(spot_price / step) * step
 
@@ -267,10 +272,13 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     for i in range(0, len(tokens), 50):
         batch = tokens[i:i+50]
         full_payload = {"mode": "FULL", "exchangeTokens": {idx_info["opt_exch"]: batch}}
-        q_res = requests.post(quote_url, json=full_payload, headers=headers, timeout=10).json()
-        if q_res.get("status") and q_res.get("data", {}).get("fetched"):
-            for item in q_res["data"]["fetched"]:
-                fetched_map[str(item["symbolToken"])] = item
+        try:
+            q_res = requests.post(quote_url, json=full_payload, headers=headers, timeout=5).json()
+            if q_res.get("status") and q_res.get("data", {}).get("fetched"):
+                for item in q_res["data"]["fetched"]:
+                    fetched_map[str(item["symbolToken"])] = item
+        except Exception:
+            pass
 
     if not fetched_map:
         return None, None, None, {}, "ऑप्शन कोट्स लाने में समस्या आई।"
@@ -324,7 +332,7 @@ def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell
             send_telegram_alert(f"⚠️ <b>ORDER REJECTED ({selected_idx})</b>\nHedge Buy विफल: {msg_buy}")
             return False, f"Hedge Buy ऑर्डर विफल: {msg_buy}"
 
-        time.sleep(0.5)
+        time.sleep(0.4)
 
         ok_sell, msg_sell = place_angel_order(jwt, akey, sell_c["exch"], sell_c["symbol"], sell_c["token"], "SELL", total_qty)
         if not ok_sell:
@@ -379,7 +387,7 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
         jwt = st.session_state["angel_jwt"]
         akey = st.session_state["angel_key"]
         place_angel_order(jwt, akey, tr["exch"], tr["sell_symbol"], tr["sell_token"], "BUY", tr["qty"])
-        time.sleep(0.5)
+        time.sleep(0.4)
         place_angel_order(jwt, akey, tr["exch"], tr["buy_symbol"], tr["buy_token"], "SELL", tr["qty"])
 
     pnl_pts = (tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - tr["buy_entry"])
@@ -478,10 +486,10 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE
+# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (हर 3 सेकंड अपडेट)
 # ==========================================
 with tab1:
-    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर")
+    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (⚡ 3-Sec Live)")
 
     has_tg = ("TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets)
     t_col1, t_col2 = st.columns([3, 1])
@@ -521,14 +529,14 @@ with tab1:
     with c_auto2:
         st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` | 🛑 **Auto Stop-Loss:** `₹{2000 * algo_lots:,.0f}` (`₹2,000/Lot`)")
 
-    @st.fragment(run_every=60)
+    @st.fragment(run_every=3)
     def render_algo_dashboard(mode_sel, selected_idx, lots_cnt, is_unlocked, is_auto_10):
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
         now_str = now_ist.strftime("%I:%M:%S %p")
         today_str = now_ist.strftime("%Y-%m-%d")
 
-        # हर रिफ्रेश पर Telegram से आए /exit या /status कमांड चेक करना
+        # हर 3 सेकंड पर Telegram से आए /exit या /status कमांड चेक करना
         tg_cmd = check_telegram_commands()
 
         if selected_idx == "Nifty 50":
@@ -559,7 +567,7 @@ with tab1:
                 spot_data.columns = spot_data.columns.get_level_values(0)
             spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
             atm_t = round(spot_price / step) * step
-            np.random.seed(int(now_ist.strftime("%H%M")) + int(atm_t))
+            np.random.seed(int(now_ist.strftime("%H%M%S")) + int(atm_t))
             strikes_t = [atm_t + (i * step) for i in range(-12, 13)]
             full_df = pd.DataFrame({
                 "STRIKE": strikes_t,
@@ -608,7 +616,7 @@ with tab1:
             if is_live_api and "angel_jwt" in st.session_state and active_tr["sell_token"] != "0":
                 ltp_map = get_live_ltp_for_tokens(
                     st.session_state["angel_jwt"], st.session_state["angel_key"],
-                    active_tr["exch"], [active_tr["sell_token"], active_tr["buy_token"]]
+                    active_tr["exch"], (active_tr["sell_token"], active_tr["buy_token"])
                 )
                 curr_sell_ltp = ltp_map.get(active_tr["sell_token"], curr_sell_ltp)
                 curr_buy_ltp = ltp_map.get(active_tr["buy_token"], curr_buy_ltp)
@@ -619,7 +627,6 @@ with tab1:
             live_pnl_pts = (active_tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - active_tr["buy_entry"])
             live_pnl_rs = round(live_pnl_pts * active_tr["qty"], 2)
 
-            # अगर Telegram से /status कमांड आया हो
             if tg_cmd == "STATUS":
                 send_telegram_alert(
                     f"📊 <b>LIVE POSITION STATUS</b>\n"
@@ -628,7 +635,6 @@ with tab1:
                     f"🛑 <b>Auto SL:</b> -₹{int(active_tr['sl_rs']):,}"
                 )
 
-            # अगर Telegram से /exit कमांड आया हो
             if tg_cmd == "EXIT":
                 close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Telegram /exit Command 📲")
                 st.warning("📲 Telegram से `/exit` कमांड मिला! पोजीशन बंद कर दी गई है।")
@@ -669,7 +675,7 @@ with tab1:
 
             st.markdown(f"""
             <div style="background: linear-gradient(90deg, #1e293b, #0f172a); padding: 16px; border-radius: 12px; border: 1px solid #334155; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
+                <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} (3-Sec Live) | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
                 <h4 style="margin: 6px 0; color: #38bdf8;">{rec_title}</h4>
                 <div style="font-size: 14px;">1️⃣ पहले Hedge Buy: <b>{rec_buy_strike} {rec_side}</b> (@ ₹{rec_buy_ltp}) &nbsp;➔&nbsp; 2️⃣ फिर ATM Sell: <b>{rec_sell_strike} {rec_side}</b> (@ ₹{rec_sell_ltp}) &nbsp;|&nbsp; अनुमानित क्रेडिट: <b>₹{est_credit_rs:,.0f}</b></div>
             </div>
@@ -711,7 +717,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन और सिग्नल
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन और सिग्नल (हर 3 सेकंड अपडेट)
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -746,9 +752,9 @@ with tab2:
     with c2:
         strike_range = st.slider("ATM के ऊपर और नीचे कितनी स्ट्राइक जोड़ें?", min_value=1, max_value=10, value=5)
     with c3:
-        auto_refresh = st.toggle("🔄 1-मिनट ऑटो रिफ्रेश", value=True, key="oc_refresh")
+        auto_refresh = st.toggle("⚡ 3-सेकंड ऑटो रिफ्रेश", value=True, key="oc_refresh")
 
-    refresh_interval = 60 if auto_refresh else None
+    refresh_interval = 3 if auto_refresh else None
 
     @st.fragment(run_every=refresh_interval)
     def render_seller_chain(selected_idx, s_range):
@@ -783,7 +789,7 @@ with tab2:
                 spot_data.columns = spot_data.columns.get_level_values(0)
             spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
             atm_temp = round(spot_price / step) * step
-            np.random.seed(int(datetime.now(ist).strftime("%H%M")) + int(atm_temp))
+            np.random.seed(int(datetime.now(ist).strftime("%H%M%S")) + int(atm_temp))
             all_strikes = [atm_temp + (i * step) for i in range(-10, 11)]
             full_df = pd.DataFrame({
                 "CALL VOL": [int(np.random.randint(90, 480) * 1000) for _ in all_strikes],
