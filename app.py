@@ -6,25 +6,54 @@ import plotly.graph_objects as go
 import requests
 import pyotp
 import time
+import os
 from datetime import datetime, timedelta
 import pytz
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
 
+HISTORY_FILE = "paper_trades_history.csv"
+
+def load_trade_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            return df.to_dict("records")
+        except Exception:
+            return []
+    return []
+
+def save_trade_history(history_list):
+    try:
+        pd.DataFrame(history_list).to_csv(HISTORY_FILE, index=False)
+    except Exception:
+        pass
+
 # ==========================================
 # Session State इनिशियलाइज़ेशन
 # ==========================================
+if "trade_history" not in st.session_state:
+    st.session_state["trade_history"] = load_trade_history()
+
 if "paper_capital" not in st.session_state:
-    st.session_state["paper_capital"] = 200000.0
+    saved_pnl = sum(
+        float(t.get("लाभ / हानि (₹)", 0))
+        for t in st.session_state["trade_history"]
+        if t.get("मोड") == "Paper"
+    )
+    st.session_state["paper_capital"] = 200000.0 + saved_pnl
+
 if "active_trade" not in st.session_state:
     st.session_state["active_trade"] = None
-if "trade_history" not in st.session_state:
-    st.session_state["trade_history"] = []
 if "auto_traded_date" not in st.session_state:
     st.session_state["auto_traded_date"] = ""
 if "last_tg_update_id" not in st.session_state:
     st.session_state["last_tg_update_id"] = 0
+if "base_oi_map" not in st.session_state:
+    st.session_state["base_oi_map"] = {}
+if "base_oi_date" not in st.session_state:
+    st.session_state["base_oi_date"] = ""
 
 # ==========================================
 # Telegram Alert और Remote Command फंक्शन्स
@@ -169,7 +198,7 @@ def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token
     except Exception as e:
         return False, str(e)
 
-@st.cache_data(ttl=2)
+@st.cache_data(ttl=5)
 def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
     headers = {
@@ -192,8 +221,8 @@ def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
         pass
     return {}
 
-@st.cache_data(ttl=2)
-def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
+@st.cache_data(ttl=5)
+def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     headers = {
         "Authorization": f"Bearer {jwt_token}",
         "Content-Type": "application/json",
@@ -284,33 +313,80 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
         return None, None, None, {}, "ऑप्शन कोट्स लाने में समस्या आई।"
 
     strikes_list = sorted(target_df["clean_strike"].unique())
-    rows = []
+    raw_rows = []
     for st_val in strikes_list:
         ce_info = contract_map.get((st_val, "CE"), {})
         pe_info = contract_map.get((st_val, "PE"), {})
 
-        ce_q = fetched_map.get(ce_info.get("token", ""), {})
-        pe_q = fetched_map.get(pe_info.get("token", ""), {})
+        ce_tok = ce_info.get("token", "")
+        pe_tok = pe_info.get("token", "")
 
-        ce_oi = int(ce_q.get("opnInterest", 0))
-        ce_chg_oi = int(ce_q.get("netChangeOpnInterest", 0)) if "netChangeOpnInterest" in ce_q else 0
+        ce_q = fetched_map.get(ce_tok, {})
+        pe_q = fetched_map.get(pe_tok, {})
 
-        pe_oi = int(pe_q.get("opnInterest", 0))
-        pe_chg_oi = int(pe_q.get("netChangeOpnInterest", 0)) if "netChangeOpnInterest" in pe_q else 0
+        ce_oi = int(float(ce_q.get("opnInterest", 0) or 0))
+        ce_api_chg = int(float(ce_q.get("netChangeOpnInterest", 0) or 0))
 
-        rows.append({
-            "CALL VOL": int(ce_q.get("tradeVolume", 0)),
-            "CALL CHG OI": ce_chg_oi,
+        pe_oi = int(float(pe_q.get("opnInterest", 0) or 0))
+        pe_api_chg = int(float(pe_q.get("netChangeOpnInterest", 0) or 0))
+
+        raw_rows.append({
+            "CE_TOKEN": ce_tok,
+            "PE_TOKEN": pe_tok,
+            "CALL VOL": int(float(ce_q.get("tradeVolume", 0) or 0)),
+            "API_CE_CHG": ce_api_chg,
             "CALL OI": ce_oi,
-            "CALL LTP": float(ce_q.get("ltp", 0.0)),
+            "CALL LTP": float(ce_q.get("ltp", 0.0) or 0.0),
             "STRIKE": st_val,
-            "PUT LTP": float(pe_q.get("ltp", 0.0)),
+            "PUT LTP": float(pe_q.get("ltp", 0.0) or 0.0),
             "PUT OI": pe_oi,
-            "PUT CHG OI": pe_chg_oi,
-            "PUT VOL": int(pe_q.get("tradeVolume", 0))
+            "API_PE_CHG": pe_api_chg,
+            "PUT VOL": int(float(pe_q.get("tradeVolume", 0) or 0))
         })
 
-    return pd.DataFrame(rows), spot_price, exp_str, contract_map, None
+    return pd.DataFrame(raw_rows), spot_price, exp_str, contract_map, None
+
+def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
+    raw_df, spot_price, exp_str, contract_map, err = fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range)
+    if raw_df is None or raw_df.empty:
+        return raw_df, spot_price, exp_str, contract_map, err
+
+    ist = pytz.timezone('Asia/Kolkata')
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+    if st.session_state["base_oi_date"] != today_str:
+        st.session_state["base_oi_date"] = today_str
+        st.session_state["base_oi_map"] = {}
+
+    df = raw_df.copy()
+    call_chgs = []
+    put_chgs = []
+
+    for _, row in df.iterrows():
+        ce_tok = row["CE_TOKEN"]
+        pe_tok = row["PE_TOKEN"]
+        ce_oi = int(row["CALL OI"])
+        pe_oi = int(row["PUT OI"])
+
+        if ce_tok and ce_tok not in st.session_state["base_oi_map"] and ce_oi > 0:
+            st.session_state["base_oi_map"][ce_tok] = ce_oi
+        if pe_tok and pe_tok not in st.session_state["base_oi_map"] and pe_oi > 0:
+            st.session_state["base_oi_map"][pe_tok] = pe_oi
+
+        ce_chg = int(row["API_CE_CHG"])
+        if ce_chg == 0 and ce_tok in st.session_state["base_oi_map"]:
+            ce_chg = ce_oi - st.session_state["base_oi_map"][ce_tok]
+
+        pe_chg = int(row["API_PE_CHG"])
+        if pe_chg == 0 and pe_tok in st.session_state["base_oi_map"]:
+            pe_chg = pe_oi - st.session_state["base_oi_map"][pe_tok]
+
+        call_chgs.append(ce_chg)
+        put_chgs.append(pe_chg)
+
+    df["CALL CHG OI"] = call_chgs
+    df["PUT CHG OI"] = put_chgs
+    final_cols = ["CALL VOL", "CALL CHG OI", "CALL OI", "CALL LTP", "STRIKE", "PUT LTP", "PUT OI", "PUT CHG OI", "PUT VOL"]
+    return df[final_cols], spot_price, exp_str, contract_map, None
 
 def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell_ltp, buy_ltp, lots, lot_qty, contract_map, trigger_src="Manual"):
     ist = pytz.timezone('Asia/Kolkata')
@@ -381,6 +457,7 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
         return
 
     ist = pytz.timezone('Asia/Kolkata')
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
     exit_time = datetime.now(ist).strftime("%I:%M:%S %p")
 
     if tr["mode"] == "🔴 LIVE ALGO (असली पैसा)" and "angel_jwt" in st.session_state:
@@ -398,6 +475,7 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
 
     mode_short = "Paper" if "PAPER" in tr["mode"] else "LIVE"
     st.session_state["trade_history"].insert(0, {
+        "तारीख": today_str,
         "मोड": mode_short,
         "इंडेक्स": tr["index"],
         "स्प्रेड": f"Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}",
@@ -407,6 +485,7 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
         "कारण": reason,
         "लाभ / हानि (₹)": pnl_rs
     })
+    save_trade_history(st.session_state["trade_history"])
 
     icon = "🛑" if "SL Hit" in reason else ("✅" if pnl_rs >= 0 else "⚠️")
     tg_exit_msg = (
@@ -486,10 +565,10 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (हर 3 सेकंड अपडेट)
+# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (स्मूथ 10-Sec Live)
 # ==========================================
 with tab1:
-    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (⚡ 3-Sec Live)")
+    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (⚡ Smooth Live)")
 
     has_tg = ("TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets)
     t_col1, t_col2 = st.columns([3, 1])
@@ -529,14 +608,13 @@ with tab1:
     with c_auto2:
         st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` | 🛑 **Auto Stop-Loss:** `₹{2000 * algo_lots:,.0f}` (`₹2,000/Lot`)")
 
-    @st.fragment(run_every=3)
+    @st.fragment(run_every=10)
     def render_algo_dashboard(mode_sel, selected_idx, lots_cnt, is_unlocked, is_auto_10):
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
         now_str = now_ist.strftime("%I:%M:%S %p")
         today_str = now_ist.strftime("%Y-%m-%d")
 
-        # हर 3 सेकंड पर Telegram से आए /exit या /status कमांड चेक करना
         tg_cmd = check_telegram_commands()
 
         if selected_idx == "Nifty 50":
@@ -675,7 +753,7 @@ with tab1:
 
             st.markdown(f"""
             <div style="background: linear-gradient(90deg, #1e293b, #0f172a); padding: 16px; border-radius: 12px; border: 1px solid #334155; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} (3-Sec Live) | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
+                <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
                 <h4 style="margin: 6px 0; color: #38bdf8;">{rec_title}</h4>
                 <div style="font-size: 14px;">1️⃣ पहले Hedge Buy: <b>{rec_buy_strike} {rec_side}</b> (@ ₹{rec_buy_ltp}) &nbsp;➔&nbsp; 2️⃣ फिर ATM Sell: <b>{rec_sell_strike} {rec_side}</b> (@ ₹{rec_sell_ltp}) &nbsp;|&nbsp; अनुमानित क्रेडिट: <b>₹{est_credit_rs:,.0f}</b></div>
             </div>
@@ -707,17 +785,26 @@ with tab1:
                     st.error(f"❌ {msg}")
 
         # ==========================================
-        # 3. आज की ट्रेड बुक
+        # 3. सेव की हुई ट्रेड बुक (Persistent History)
         # ==========================================
         if st.session_state["trade_history"]:
-            st.markdown("### 📜 ट्रेड बुक (Completed Trades)")
+            h_col1, h_col2 = st.columns([4, 1])
+            with h_col1:
+                st.markdown("### 📜 ट्रेड बुक (Saved Trade History)")
+            with h_col2:
+                if st.button("🗑️ हिस्ट्री साफ करें", key="clear_hist_btn"):
+                    st.session_state["trade_history"] = []
+                    st.session_state["paper_capital"] = 200000.0
+                    if os.path.exists(HISTORY_FILE):
+                        os.remove(HISTORY_FILE)
+                    st.rerun()
             hist_df = pd.DataFrame(st.session_state["trade_history"])
-            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+            st.dataframe(hist_df, use_container_width=True, hide_index=True, key="saved_history_table")
 
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन और सिग्नल (हर 3 सेकंड अपडेट)
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन और Top 3 Strikes Summary
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -752,9 +839,9 @@ with tab2:
     with c2:
         strike_range = st.slider("ATM के ऊपर और नीचे कितनी स्ट्राइक जोड़ें?", min_value=1, max_value=10, value=5)
     with c3:
-        auto_refresh = st.toggle("⚡ 3-सेकंड ऑटो रिफ्रेश", value=True, key="oc_refresh")
+        auto_refresh = st.toggle("⚡ स्मूथ लाइव रिफ्रेश (10s)", value=True, key="oc_refresh")
 
-    refresh_interval = 3 if auto_refresh else None
+    refresh_interval = 10 if auto_refresh else None
 
     @st.fragment(run_every=refresh_interval)
     def render_seller_chain(selected_idx, s_range):
@@ -814,6 +901,36 @@ with tab2:
         data_badge = f"🟢 **ANGEL ONE LIVE DATA (Expiry: {expiry_label})**" if is_live else "🟡 **DEMO MODE**"
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
 
+        # ==========================================
+        # Top 3 Strikes OI & Change in OI Summary
+        # ==========================================
+        summary_df = filtered_df.copy()
+        summary_df["TOTAL OI"] = summary_df["CALL OI"] + summary_df["PUT OI"]
+        summary_df["TOTAL CHG OI"] = summary_df["CALL CHG OI"] + summary_df["PUT CHG OI"]
+
+        top3_oi = summary_df.nlargest(3, "TOTAL OI")[["STRIKE", "CALL OI", "PUT OI", "TOTAL OI"]]
+        top3_chg = summary_df.reindex(summary_df["TOTAL CHG OI"].abs().sort_values(ascending=False).index).head(3)[
+            ["STRIKE", "CALL CHG OI", "PUT CHG OI", "TOTAL CHG OI"]
+        ]
+
+        s_col1, s_col2 = st.columns(2)
+        with s_col1:
+            st.markdown("##### 🔥 Top 3 Strikes (सबसे ज़्यादा Total OI)")
+            st.dataframe(
+                top3_oi.style.format({"CALL OI": "{:,}", "PUT OI": "{:,}", "TOTAL OI": "{:,}"}),
+                use_container_width=True,
+                hide_index=True,
+                key="top3_oi_table"
+            )
+        with s_col2:
+            st.markdown("##### ⚡ Top 3 Strikes (सबसे ज़्यादा Change in OI)")
+            st.dataframe(
+                top3_chg.style.format({"CALL CHG OI": "{:+,}", "PUT CHG OI": "{:+,}", "TOTAL CHG OI": "{:+,}"}),
+                use_container_width=True,
+                hide_index=True,
+                key="top3_chg_oi_table"
+            )
+
         def style_seller_chain(row):
             styles = [''] * len(row)
             is_atm = (row['STRIKE'] == atm_strike)
@@ -840,7 +957,7 @@ with tab2:
             "CALL VOL": "{:,}", "CALL CHG OI": "{:+,}", "CALL OI": "{:,}", "CALL LTP": "₹{:.1f}",
             "PUT LTP": "₹{:.1f}", "PUT OI": "{:,}", "PUT CHG OI": "{:+,}", "PUT VOL": "{:,}"
         })
-        st.dataframe(styled_df, use_container_width=True, hide_index=True, height=430)
+        st.dataframe(styled_df, use_container_width=True, hide_index=True, height=430, key="main_oc_table")
 
     render_seller_chain(idx, strike_range)
 
