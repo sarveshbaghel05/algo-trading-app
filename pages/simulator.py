@@ -1,223 +1,263 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# पेज सेटअप
-st.set_page_config(page_title="Options Simulator (StockMock Style)", layout="wide")
+st.set_page_config(page_title="StockMock Style Options Simulator", layout="wide")
 
-LOT_SIZE = 75  # Nifty Lot Size
+# इंडेक्स के अनुसार लॉट साइज और स्ट्राइक गैप
+INDEX_CONFIG = {
+    "NIFTY": {"lot": 75, "step": 50, "base_spot": 24250},
+    "BANKNIFTY": {"lot": 30, "step": 100, "base_spot": 51800},
+    "SENSEX": {"lot": 20, "step": 100, "base_spot": 79800},
+}
 
-# --- 1. सैंपल 1-मिनट Historical Data जनरेटर (Price + OI + Change in OI) ---
+EXPIRIES = {
+    "20 Nov 2026 (Weekly)": ["16 Nov 2026", "17 Nov 2026", "18 Nov 2026", "19 Nov 2026", "20 Nov 2026 (Expiry)"],
+    "27 Nov 2026 (Monthly)": ["23 Nov 2026", "24 Nov 2026", "25 Nov 2026", "26 Nov 2026", "27 Nov 2026 (Expiry)"],
+}
+
+# --- 1. मल्टी-इंडेक्स और मल्टी-डेट सैंपल डेटा जनरेटर ---
 @st.cache_data
-def generate_sample_market_data():
-    np.random.seed(42)
+def get_day_data(index_name, expiry_name, selected_date):
+    seed_val = abs(hash(f"{index_name}_{expiry_name}_{selected_date}")) % (2**31)
+    np.random.seed(seed_val)
+
+    cfg = INDEX_CONFIG[index_name]
+    step = cfg["step"]
+    start_spot = cfg["base_spot"] + np.random.randint(-300, 300)
+
     start_time = datetime(2026, 11, 19, 9, 15)
     minutes = 376  # 09:15 से 15:30 तक
     timestamps = [start_time + timedelta(minutes=i) for i in range(minutes)]
 
-    # Nifty Spot का मूवमेंट बनाना
-    spot_changes = np.random.normal(0.5, 6.5, size=minutes)
-    spot_prices = 24200 + np.cumsum(spot_changes)
-    spot_prices = np.round(spot_prices, 2)
+    # दिन भर का स्पॉट मूवमेंट
+    volatility = step * 0.14
+    spot_moves = np.random.normal(0, volatility, size=minutes)
+    spots = np.round(start_spot + np.cumsum(spot_moves), 2)
 
-    strikes = list(range(23900, 24550, 50))
-    records = []
+    center_strike = int(round(start_spot / step) * step)
+    strikes = list(range(center_strike - (8 * step), center_strike + (9 * step), step))
 
-    # सुबह 9:15 का शुरुआती OI बेसलाइन
-    base_ce_oi = {k: np.random.randint(15, 45) * 100000 for k in strikes}
-    base_pe_oi = {k: np.random.randint(15, 45) * 100000 for k in strikes}
+    # एक्सपायरी के दिन थीटा कम होगा
+    is_expiry = "Expiry" in selected_date
+    base_iv_factor = 0.45 if is_expiry else 1.0
+
+    base_ce_oi = {k: np.random.randint(12, 45) * 100000 for k in strikes}
+    base_pe_oi = {k: np.random.randint(12, 45) * 100000 for k in strikes}
     curr_ce_oi = base_ce_oi.copy()
     curr_pe_oi = base_pe_oi.copy()
 
+    records = []
     for idx, ts in enumerate(timestamps):
-        spot = spot_prices[idx]
-        time_decay = (minutes - idx) / minutes  # समय के साथ थीटा डीके
+        spot = spots[idx]
+        decay = (minutes - idx) / minutes
 
         for strike in strikes:
-            # प्रीमियम कैलकुलेशन (Intrinsic + Time Value)
-            ce_intrinsic = max(0.0, spot - strike)
-            pe_intrinsic = max(0.0, strike - spot)
+            ce_intr = max(0.0, spot - strike)
+            pe_intr = max(0.0, strike - spot)
             dist = abs(spot - strike)
-            time_val = max(2.0, (130 * np.exp(-dist / 220)) * (0.4 + 0.6 * time_decay))
 
-            ce_price = round(ce_intrinsic + time_val + np.random.uniform(-0.8, 0.8), 2)
-            pe_price = round(pe_intrinsic + time_val + np.random.uniform(-0.8, 0.8), 2)
+            time_val = max(1.5, (step * 2.4 * base_iv_factor * np.exp(-dist / (step * 4.5))) * (0.35 + 0.65 * decay))
+            ce_ltp = round(max(0.5, ce_intr + time_val + np.random.uniform(-1.0, 1.0)), 2)
+            pe_ltp = round(max(0.5, pe_intr + time_val + np.random.uniform(-1.0, 1.0)), 2)
 
-            # हर मिनट OI में बदलाव
             if idx > 0:
-                curr_ce_oi[strike] = max(100000, curr_ce_oi[strike] + np.random.randint(-25000, 45000))
-                curr_pe_oi[strike] = max(100000, curr_pe_oi[strike] + np.random.randint(-25000, 45000))
-
-            ce_coi = curr_ce_oi[strike] - base_ce_oi[strike]
-            pe_coi = curr_pe_oi[strike] - base_pe_oi[strike]
+                curr_ce_oi[strike] = max(50000, curr_ce_oi[strike] + np.random.randint(-30000, 50000))
+                curr_pe_oi[strike] = max(50000, curr_pe_oi[strike] + np.random.randint(-30000, 50000))
 
             records.append({
-                "timestamp": ts,
                 "time_str": ts.strftime("%H:%M"),
                 "spot": spot,
                 "strike": strike,
-                "ce_price": max(0.5, ce_price),
+                "ce_ltp": ce_ltp,
                 "ce_oi": curr_ce_oi[strike],
-                "ce_coi": ce_coi,
-                "pe_price": max(0.5, pe_price),
+                "ce_coi": curr_ce_oi[strike] - base_ce_oi[strike],
+                "pe_ltp": pe_ltp,
                 "pe_oi": curr_pe_oi[strike],
-                "pe_coi": pe_coi,
+                "pe_coi": curr_pe_oi[strike] - base_pe_oi[strike],
             })
 
     return pd.DataFrame(records), [ts.strftime("%H:%M") for ts in timestamps]
 
-df_data, all_times = generate_sample_market_data()
-
-# --- 2. Session State इनिशियलाइज़ेशन ---
+# --- 2. Session State ---
 if "sim_idx" not in st.session_state:
-    st.session_state.sim_idx = 45  # डिफ़ॉल्ट सुबह 10:00 AM से शुरू
-if "positions" not in st.session_state:
-    st.session_state.positions = []
-if "realized_pnl" not in st.session_state:
-    st.session_state.realized_pnl = 0.0
+    st.session_state.sim_idx = 45  # 10:00 AM
+if "sim_positions" not in st.session_state:
+    st.session_state.sim_positions = []
+if "sim_booked_pnl" not in st.session_state:
+    st.session_state.sim_booked_pnl = 0.0
+if "last_context" not in st.session_state:
+    st.session_state.last_context = ""
 
-def shift_time(delta_mins):
-    new_idx = st.session_state.sim_idx + delta_mins
-    st.session_state.sim_idx = max(0, min(len(all_times) - 1, new_idx))
+# --- 3. StockMock जैसा टॉप फिल्टर बार (Index, Expiry, Date, Lots) ---
+st.markdown("### 📊 StockMock Style Options Simulator (Price + Historical OI)")
 
-# --- 3. हेडर और Time Machine कंट्रोल बार ---
-st.title("📊 Manual Options Simulator (OI + Price)")
-st.caption("सैंपल डेटा: NIFTY Weekly Expiry | अपनी स्ट्रैटेजी मैन्युअल टेस्ट करें")
+top1, top2, top3, top4 = st.columns([1.1, 1.4, 1.4, 0.9])
+sel_index = top1.selectbox("1. Index चुनें", list(INDEX_CONFIG.keys()))
+sel_expiry = top2.selectbox("2. Expiry चुनें", list(EXPIRIES.keys()))
+sel_date = top3.selectbox("3. Backtest Date चुनें", EXPIRIES[sel_expiry])
+default_lots = top4.number_input("Lots", min_value=1, max_value=50, value=1)
 
-curr_time_str = all_times[st.session_state.sim_idx]
-curr_slice = df_data[df_data["time_str"] == curr_time_str].copy()
-curr_spot = curr_slice["spot"].iloc[0]
-atm_strike = min(curr_slice["strike"], key=lambda x: abs(x - curr_spot))
-
-# टॉप मेट्रिक्स और टाइम कंट्रोल
-c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1.4])
-c1.metric("⏰ सिम्युलेटर समय", curr_time_str)
-c2.metric("📈 NIFTY Spot", f"{curr_spot:,.2f}")
-c3.metric("🎯 ATM Strike", f"{atm_strike}")
-
-# टाइम जंप ड्रॉपडाउन
-selected_jump = c4.selectbox("सीधे समय पर जाएं:", all_times, index=st.session_state.sim_idx)
-if selected_jump != curr_time_str:
-    st.session_state.sim_idx = all_times.index(selected_jump)
-    st.rerun()
-
-# आगे-पीछे जाने वाले बटन
-st.markdown("##### ⏩ Time Machine Controls")
-b1, b2, b3, b4, b5, b6, b7 = st.columns([1, 1, 1, 1, 1, 1, 1.5])
-if b1.button("◀ -15m", use_container_width=True):
-    shift_time(-15)
-    st.rerun()
-if b2.button("◀ -5m", use_container_width=True):
-    shift_time(-5)
-    st.rerun()
-if b3.button("◀ -1m", use_container_width=True):
-    shift_time(-1)
-    st.rerun()
-if b4.button("▶ +1m", type="primary", use_container_width=True):
-    shift_time(1)
-    st.rerun()
-if b5.button("▶ +5m", type="primary", use_container_width=True):
-    shift_time(5)
-    st.rerun()
-if b6.button("▶ +15m", type="primary", use_container_width=True):
-    shift_time(15)
-    st.rerun()
-if b7.button("🔄 Reset Day", use_container_width=True):
+# अगर यूज़र ने इंडेक्स, एक्सपायरी या डेट बदली तो पोजीशन रीसेट करें
+current_context = f"{sel_index}_{sel_expiry}_{sel_date}"
+if st.session_state.last_context != current_context:
+    st.session_state.last_context = current_context
     st.session_state.sim_idx = 45
-    st.session_state.positions = []
-    st.session_state.realized_pnl = 0.0
+    st.session_state.sim_positions = []
+    st.session_state.sim_booked_pnl = 0.0
+
+df_day, all_times = get_day_data(sel_index, sel_expiry, sel_date)
+lot_size = INDEX_CONFIG[sel_index]["lot"]
+
+def move_time(mins):
+    st.session_state.sim_idx = max(0, min(len(all_times) - 1, st.session_state.sim_idx + mins))
+
+curr_time = all_times[st.session_state.sim_idx]
+curr_df = df_day[df_day["time_str"] == curr_time].reset_index(drop=True)
+spot_now = curr_df["spot"].iloc[0]
+atm_strike = min(curr_df["strike"], key=lambda x: abs(x - spot_now))
+
+# --- 4. StockMock Time Controller पट्टी ---
+st.markdown("---")
+tc1, tc2, tc3, tc4 = st.columns([1.2, 1.2, 1.2, 1.4])
+tc1.metric("📅 Date & Time", f"{sel_date.split(' ')[0]} | {curr_time}")
+tc2.metric(f"📈 {sel_index} Spot", f"{spot_now:,.2f}")
+tc3.metric("🎯 ATM Strike", f"{atm_strike}")
+jump_t = tc4.selectbox("Jump to Time", all_times, index=st.session_state.sim_idx, label_visibility="collapsed")
+if jump_t != curr_time:
+    st.session_state.sim_idx = all_times.index(jump_t)
     st.rerun()
 
-st.divider()
+btn_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1.2])
+if btn_cols[0].button("◀ -30m", use_container_width=True): move_time(-30); st.rerun()
+if btn_cols[1].button("◀ -15m", use_container_width=True): move_time(-15); st.rerun()
+if btn_cols[2].button("◀ -5m", use_container_width=True): move_time(-5); st.rerun()
+if btn_cols[3].button("◀ -1m", use_container_width=True): move_time(-1); st.rerun()
+if btn_cols[4].button("▶ +1m", type="primary", use_container_width=True): move_time(1); st.rerun()
+if btn_cols[5].button("▶ +5m", type="primary", use_container_width=True): move_time(5); st.rerun()
+if btn_cols[6].button("▶ +15m", type="primary", use_container_width=True): move_time(15); st.rerun()
+if btn_cols[7].button("🔄 Reset", use_container_width=True):
+    st.session_state.sim_idx = 45
+    st.session_state.sim_positions = []
+    st.session_state.sim_booked_pnl = 0.0
+    st.rerun()
 
-# --- 4. क्विक ऑर्डर पैनल (Buy / Sell करने के लिए) ---
-st.subheader("🛒 नया ट्रेड लें (Order Entry)")
-oc1, oc2, oc3, oc4, oc5 = st.columns([1.2, 1, 1, 1, 1.2])
+# --- 5. StockMock Style Option Chain (सीधे टेबल में Sell/Buy बटन) ---
+st.markdown("---")
+st.subheader(f"📋 Option Chain (हर स्ट्राइक के सामने S = Sell, B = Buy दबाएं)")
 
-order_strike = oc1.selectbox("Strike चुनें", curr_slice["strike"].tolist(), index=curr_slice["strike"].tolist().index(atm_strike))
-order_type = oc2.selectbox("Option Type", ["CE", "PE"])
-order_side = oc3.selectbox("Action", ["SELL", "BUY"])
-order_lots = oc4.number_input("Lots (1 Lot = 75)", min_value=1, max_value=50, value=1)
+# टॉप 3 Call & Put OI हाइलाइट
+top_ce = curr_df.nlargest(3, "ce_oi")
+top_pe = curr_df.nlargest(3, "pe_oi")
+oi_c1, oi_c2 = st.columns(2)
+oi_c1.error(f"🔴 **Top 3 Call OI:** {', '.join(top_ce['strike'].astype(str))} | Chg OI: **{top_ce['ce_coi'].sum():+,}**")
+oi_c2.success(f"🟢 **Top 3 Put OI:** {', '.join(top_pe['strike'].astype(str))} | Chg OI: **{top_pe['pe_coi'].sum():+,}**")
 
-row_selected = curr_slice[curr_slice["strike"] == order_strike].iloc[0]
-exec_price = row_selected["ce_price"] if order_type == "CE" else row_selected["pe_price"]
+# हेडर लाइन
+h = st.columns([1.2, 1.2, 1.0, 1.1, 1.1, 1.0, 1.2, 1.2])
+h[0].markdown("**CE OI (Chg)**")
+h[1].markdown("**CE LTP**")
+h[2].markdown("**CE Trade**")
+h[3].markdown("**STRIKE**")
+h[4].markdown("**PE Trade**")
+h[5].markdown("**PE LTP**")
+h[6].markdown("**PE OI (Chg)**")
 
-if oc5.button(f"✅ {order_side} @ ₹{exec_price}", type="primary", use_container_width=True):
-    st.session_state.positions.append({
-        "id": len(st.session_state.positions) + 1,
-        "entry_time": curr_time_str,
-        "strike": order_strike,
-        "type": order_type,
-        "side": order_side,
-        "lots": order_lots,
-        "qty": order_lots * LOT_SIZE,
-        "entry_price": exec_price,
-        "status": "OPEN",
-        "exit_price": None,
-        "exit_time": None
+def add_trade(strike, opt_type, side, price):
+    st.session_state.sim_positions.append({
+        "id": len(st.session_state.sim_positions) + 1,
+        "time": curr_time,
+        "strike": strike,
+        "type": opt_type,
+        "side": side,
+        "lots": default_lots,
+        "qty": default_lots * lot_size,
+        "entry": price,
+        "status": "OPEN"
     })
-    st.rerun()
 
-# --- 5. लाइव पोजीशन और MTM ट्रैकर ---
-st.subheader("💼 आपकी पोजीशंस और Live MTM")
+# ATM के आसपास 11 स्ट्राइक्स दिखाएं ताकि स्क्रीन तेज़ चले
+atm_idx = curr_df[curr_df["strike"] == atm_strike].index[0]
+view_df = curr_df.iloc[max(0, atm_idx - 5): min(len(curr_df), atm_idx + 6)]
 
-unrealized_pnl = 0.0
-open_positions = [p for p in st.session_state.positions if p["status"] == "OPEN"]
+for _, r in view_df.iterrows():
+    strike = int(r["strike"])
+    is_atm = (strike == atm_strike)
+    cols = st.columns([1.2, 1.2, 1.0, 1.1, 1.1, 1.0, 1.2, 1.2])
 
-if open_positions:
-    for pos in open_positions:
-        s_row = curr_slice[curr_slice["strike"] == pos["strike"]].iloc[0]
-        ltp = s_row["ce_price"] if pos["type"] == "CE" else s_row["pe_price"]
+    cols[0].caption(f"{r['ce_oi']//100000:.1f}L ({r['ce_coi']//1000:+}K)")
+    cols[1].write(f"**₹{r['ce_ltp']}**")
 
-        if pos["side"] == "SELL":
-            pnl = (pos["entry_price"] - ltp) * pos["qty"]
-        else:
-            pnl = (ltp - pos["entry_price"]) * pos["qty"]
+    b_ce1, b_ce2 = cols[2].columns(2)
+    if b_ce1.button("S", key=f"sce_{strike}", help="Sell Call"):
+        add_trade(strike, "CE", "SELL", r["ce_ltp"]); st.rerun()
+    if b_ce2.button("B", key=f"bce_{strike}", help="Buy Call"):
+        add_trade(strike, "CE", "BUY", r["ce_ltp"]); st.rerun()
 
-        unrealized_pnl += pnl
+    if is_atm:
+        cols[3].markdown(f"**:orange[⭐ {strike}]**")
+    else:
+        cols[3].markdown(f"**{strike}**")
 
-        p1, p2, p3, p4, p5, p6 = st.columns([2, 1, 1.2, 1.2, 1.5, 1])
-        p1.write(f"**{pos['strike']} {pos['type']}** ({pos['side']} {pos['lots']}L @ {pos['entry_time']})")
-        p2.write(f"Entry: ₹{pos['entry_price']}")
-        p3.write(f"LTP: ₹{ltp}")
-        pnl_color = "green" if pnl >= 0 else "red"
-        p4.markdown(f"P&L: :{pnl_color}[**₹{pnl:,.2f}**]")
-        if p6.button("❌ Exit", key=f"exit_{pos['id']}"):
-            pos["status"] = "CLOSED"
-            pos["exit_price"] = ltp
-            pos["exit_time"] = curr_time_str
-            st.session_state.realized_pnl += pnl
+    b_pe1, b_pe2 = cols[4].columns(2)
+    if b_pe1.button("S", key=f"spe_{strike}", help="Sell Put"):
+        add_trade(strike, "PE", "SELL", r["pe_ltp"]); st.rerun()
+    if b_pe2.button("B", key=f"bpe_{strike}", help="Buy Put"):
+        add_trade(strike, "PE", "BUY", r["pe_ltp"]); st.rerun()
+
+    cols[5].write(f"**₹{r['pe_ltp']}**")
+    cols[6].caption(f"{r['pe_oi']//100000:.1f}L ({r['pe_coi']//1000:+}K)")
+
+# --- 6. Live Positions, MTM & StockMock Payoff Graph ---
+st.markdown("---")
+st.subheader("💼 Positions & Payoff Chart")
+
+open_pos = [p for p in st.session_state.sim_positions if p["status"] == "OPEN"]
+running_pnl = 0.0
+
+if open_pos:
+    for p in open_pos:
+        s_row = curr_df[curr_df["strike"] == p["strike"]].iloc[0]
+        ltp = s_row["ce_ltp"] if p["type"] == "CE" else s_row["pe_ltp"]
+        pnl = (p["entry"] - ltp) * p["qty"] if p["side"] == "SELL" else (ltp - p["entry"]) * p["qty"]
+        running_pnl += pnl
+
+        pc1, pc2, pc3, pc4, pc5 = st.columns([2.2, 1.2, 1.2, 1.5, 1])
+        badge = "🔴 SELL" if p["side"] == "SELL" else "🟢 BUY"
+        pc1.write(f"{badge} **{p['strike']} {p['type']}** ({p['lots']}L @ {p['time']})")
+        pc2.write(f"Entry: ₹{p['entry']}")
+        pc3.write(f"LTP: ₹{ltp}")
+        color = "green" if pnl >= 0 else "red"
+        pc4.markdown(f"MTM: :{color}[**₹{pnl:,.2f}**]")
+        if pc5.button("Exit", key=f"ex_{p['id']}"):
+            p["status"] = "CLOSED"
+            st.session_state.sim_booked_pnl += pnl
             st.rerun()
+
+    # StockMock जैसा Payoff Graph (Expiry पर प्रॉफिट/लॉस कैसा दिखेगा)
+    spot_range = np.linspace(spot_now * 0.96, spot_now * 1.04, 100)
+    payoff = np.zeros_like(spot_range) + st.session_state.sim_booked_pnl
+    for p in open_pos:
+        if p["type"] == "CE":
+            intr = np.maximum(0, spot_range - p["strike"])
+        else:
+            intr = np.maximum(0, p["strike"] - spot_range)
+        leg_pnl = (p["entry"] - intr) * p["qty"] if p["side"] == "SELL" else (intr - p["entry"]) * p["qty"]
+        payoff += leg_pnl
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=spot_range, y=payoff, mode="lines", name="Expiry Payoff", line=dict(color="#00CC96", width=3)))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.add_vline(x=spot_now, line_dash="dot", line_color="orange", annotation_text="Current Spot")
+    fig.update_layout(title="📈 Expiry Payoff Graph (StockMock Style)", xaxis_title=f"{sel_index} Price", yaxis_title="Profit / Loss (₹)", height=320, margin=dict(l=20, r=20, t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("अभी कोई ओपन पोजीशन नहीं है। ऊपर से Buy या Sell करके ट्रेड शुरू करें।")
+    st.info("ऊपर Option Chain में किसी भी स्ट्राइक के सामने **S** (Sell) या **B** (Buy) दबाकर अपनी स्ट्रैटेजी बनाएं।")
 
-total_mtm = st.session_state.realized_pnl + unrealized_pnl
+net_total = st.session_state.sim_booked_pnl + running_pnl
 m1, m2, m3 = st.columns(3)
-m1.metric("Running MTM (Open)", f"₹{unrealized_pnl:,.2f}")
-m2.metric("Booked P&L (Closed)", f"₹{st.session_state.realized_pnl:,.2f}")
-m3.metric("Total Net P&L", f"₹{total_mtm:,.2f}", delta=f"{total_mtm:,.2f}")
-
-st.divider()
-
-# --- 6. Option Chain टेबल (Price + OI + Change in OI) ---
-st.subheader(f"📋 Option Chain @ {curr_time_str} (ATM: {atm_strike})")
-
-# टॉप 3 Call और Put OI समरी (आपके पसंदीदा फीचर के अनुसार)
-top_ce = curr_slice.nlargest(3, "ce_oi")
-top_pe = curr_slice.nlargest(3, "pe_oi")
-s_col1, s_col2 = st.columns(2)
-s_col1.warning(f"🔴 **Top 3 Call OI Strikes:** {', '.join(top_ce['strike'].astype(str))} | Total Change in OI: **{top_ce['ce_coi'].sum():+,}**")
-s_col2.success(f"🟢 **Top 3 Put OI Strikes:** {', '.join(top_pe['strike'].astype(str))} | Total Change in OI: **{top_pe['pe_coi'].sum():+,}**")
-
-display_df = pd.DataFrame({
-    "CE OI": curr_slice["ce_oi"].apply(lambda x: f"{x:,}"),
-    "CE Chg OI": curr_slice["ce_coi"].apply(lambda x: f"{x:+,}"),
-    "CE LTP": curr_slice["ce_price"],
-    "STRIKE": curr_slice["strike"].apply(lambda x: f"⭐ {x}" if x == atm_strike else f"{x}"),
-    "PE LTP": curr_slice["pe_price"],
-    "PE Chg OI": curr_slice["pe_coi"].apply(lambda x: f"{x:+,}"),
-    "PE OI": curr_slice["pe_oi"].apply(lambda x: f"{x:,}"),
-})
-
-st.dataframe(display_df, use_container_width=True, hide_index=True, height=500)
+m1.metric("Running MTM", f"₹{running_pnl:,.2f}")
+m2.metric("Booked P&L", f"₹{st.session_state.sim_booked_pnl:,.2f}")
+m3.metric("Net Total P&L", f"₹{net_total:,.2f}", delta=f"{net_total:,.2f}")
