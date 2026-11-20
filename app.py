@@ -280,7 +280,7 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
     max_hedge = 1000 if selected_idx == "Sensex" else 300
-    fetch_span = max(s_range * step, max_hedge + step)
+    fetch_span = max(s_range * step, max_hedge + step, 3 * step)
     min_s = atm_strike - fetch_span
     max_s = atm_strike + fetch_span
     target_df = exp_df[(exp_df["clean_strike"] >= min_s) & (exp_df["clean_strike"] <= max_s)].copy()
@@ -804,7 +804,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन और Top 3 Strikes Summary
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -898,38 +898,16 @@ with tab2:
         safe_call_sell_strike = filtered_df.loc[filtered_df["CALL OI"].idxmax(), "STRIKE"]
         safe_put_sell_strike = filtered_df.loc[filtered_df["PUT OI"].idxmax(), "STRIKE"]
 
+        # ऊपर की 3 स्ट्राइक का कुल Call Change in OI और नीचे की 3 स्ट्राइक का कुल Put Change in OI
+        up_3_df = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3 * step)]
+        down_3_df = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3 * step)]
+
+        up_3_call_chg = int(up_3_df["CALL CHG OI"].sum()) if not up_3_df.empty else 0
+        down_3_put_chg = int(down_3_df["PUT CHG OI"].sum()) if not down_3_df.empty else 0
+
         data_badge = f"🟢 **ANGEL ONE LIVE DATA (Expiry: {expiry_label})**" if is_live else "🟡 **DEMO MODE**"
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
-
-        # ==========================================
-        # Top 3 Strikes OI & Change in OI Summary
-        # ==========================================
-        summary_df = filtered_df.copy()
-        summary_df["TOTAL OI"] = summary_df["CALL OI"] + summary_df["PUT OI"]
-        summary_df["TOTAL CHG OI"] = summary_df["CALL CHG OI"] + summary_df["PUT CHG OI"]
-
-        top3_oi = summary_df.nlargest(3, "TOTAL OI")[["STRIKE", "CALL OI", "PUT OI", "TOTAL OI"]]
-        top3_chg = summary_df.reindex(summary_df["TOTAL CHG OI"].abs().sort_values(ascending=False).index).head(3)[
-            ["STRIKE", "CALL CHG OI", "PUT CHG OI", "TOTAL CHG OI"]
-        ]
-
-        s_col1, s_col2 = st.columns(2)
-        with s_col1:
-            st.markdown("##### 🔥 Top 3 Strikes (सबसे ज़्यादा Total OI)")
-            st.dataframe(
-                top3_oi.style.format({"CALL OI": "{:,}", "PUT OI": "{:,}", "TOTAL OI": "{:,}"}),
-                use_container_width=True,
-                hide_index=True,
-                key="top3_oi_table"
-            )
-        with s_col2:
-            st.markdown("##### ⚡ Top 3 Strikes (सबसे ज़्यादा Change in OI)")
-            st.dataframe(
-                top3_chg.style.format({"CALL CHG OI": "{:+,}", "PUT CHG OI": "{:+,}", "TOTAL CHG OI": "{:+,}"}),
-                use_container_width=True,
-                hide_index=True,
-                key="top3_chg_oi_table"
-            )
+        st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
         def style_seller_chain(row):
             styles = [''] * len(row)
