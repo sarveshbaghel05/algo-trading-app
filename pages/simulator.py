@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="StockMock Pro Simulator", layout="wide")
+st.set_page_config(page_title="Options Simulator", layout="wide")
 
 INDEX_CONFIG = {
     "NIFTY": {"lot": 75, "step": 50, "base_spot": 24250},
@@ -34,7 +34,8 @@ def get_day_data(index_name, expiry_name, selected_date):
     spots = np.round(start_spot + np.cumsum(spot_moves), 2)
 
     center_strike = int(round(start_spot / step) * step)
-    strikes = list(range(center_strike - (6 * step), center_strike + (7 * step), step))
+    # ATM के ऊपर-नीचे 10+ स्ट्राइक्स कवर करने के लिए 15 स्ट्राइक्स की रेंज जनरेट करें
+    strikes = list(range(center_strike - (15 * step), center_strike + (16 * step), step))
 
     is_expiry = "Expiry" in selected_date
     base_iv_factor = 0.45 if is_expiry else 1.0
@@ -111,10 +112,13 @@ curr_df = df_day[df_day["time_str"] == curr_time].reset_index(drop=True)
 spot_now = curr_df["spot"].iloc[0]
 atm_strike = min(curr_df["strike"], key=lambda x: abs(x - spot_now))
 
+# ATM के ऊपर 10 और नीचे 10 स्ट्राइक्स (कुल 21 स्ट्राइक्स) निकालें
+atm_idx = curr_df[curr_df["strike"] == atm_strike].index[0]
+view_df = curr_df.iloc[max(0, atm_idx - 10): min(len(curr_df), atm_idx + 11)].copy().reset_index(drop=True)
+
 # --- 2. Spot & Time Machine Controller ---
 st.info(f"⏰ **Time:** {curr_time}  |  📈 **{sel_index} Spot:** {spot_now:,.2f}  |  🎯 **ATM:** {atm_strike}")
 
-# टाइम जंप स्लाइडर (मोबाइल पर सबसे तेज़ और कम जगह लेने वाला कंट्रोल)
 jump_t = st.select_slider("समय आगे-पीछे खिसकाएं (Time Slider):", options=all_times, value=curr_time)
 if jump_t != curr_time:
     st.session_state.sim_idx = all_times.index(jump_t)
@@ -182,17 +186,17 @@ if open_pos:
     fig.update_layout(title="📈 Expiry Payoff Graph", height=260, margin=dict(l=10, r=10, t=35, b=10), xaxis_title=sel_index, yaxis_title="P&L (₹)")
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.write(f"💰 **Booked P&L:** ₹{st.session_state.sim_booked_pnl:,.0f} | नीचे Option Chain से **Buy** या **Sell** दबाकर ट्रेड बनाएं — आपका MTM और Payoff Graph यहीं दिखेगा।")
+    st.write(f"💰 **Booked P&L:** ₹{st.session_state.sim_booked_pnl:,.0f} | नीचे Quick Trade Bar से स्ट्राइक चुनकर **Buy** या **Sell** करें।")
 
-# --- 4. नीचे का सेक्शन: Option Chain (Buy/Sell बटन के साथ) ---
+# --- 4. नीचे का सेक्शन: Live-Style Option Chain (ATM ± 10 Strikes) ---
 st.divider()
-st.subheader(f"📋 Option Chain @ {curr_time} (ATM: {atm_strike})")
+st.subheader(f"📋 Option Chain @ {curr_time} (ATM: {atm_strike} | ±10 Strikes)")
 
-top_ce = curr_df.nlargest(3, "ce_oi")
-top_pe = curr_df.nlargest(3, "pe_oi")
+top_ce = view_df.nlargest(3, "ce_oi")
+top_pe = view_df.nlargest(3, "pe_oi")
 s1, s2 = st.columns(2)
-s1.warning(f"🔴 **Top 3 CE OI:** {', '.join(top_ce['strike'].astype(str))} | Chg: **{top_ce['ce_coi'].sum():+,}**")
-s2.success(f"🟢 **Top 3 PE OI:** {', '.join(top_pe['strike'].astype(str))} | Chg: **{top_pe['pe_coi'].sum():+,}**")
+s1.error(f"🔴 **Top 3 Call OI:** {', '.join(top_ce['strike'].astype(str))} | Total Chg OI: **{top_ce['ce_coi'].sum():+,}**")
+s2.success(f"🟢 **Top 3 Put OI:** {', '.join(top_pe['strike'].astype(str))} | Total Chg OI: **{top_pe['pe_coi'].sum():+,}**")
 
 def add_trade(strike, opt_type, side, price):
     st.session_state.sim_positions.append({
@@ -207,42 +211,28 @@ def add_trade(strike, opt_type, side, price):
         "status": "OPEN"
     })
 
-# हेडर लाइन
-h1, h2, h3, h4, h5 = st.columns([1.4, 1.3, 1.1, 1.3, 1.4])
-h1.markdown("**CE OI (Chg) | LTP**")
-h2.markdown("**CALL Buy/Sell**")
-h3.markdown("**STRIKE**")
-h4.markdown("**PUT Buy/Sell**")
-h5.markdown("**PE LTP | OI (Chg)**")
+strikes_list = view_df["strike"].tolist()
+qt1, qt2, qt3, qt4, qt5 = st.columns([1.4, 1, 1, 1, 1])
+sel_strike = qt1.selectbox("Strike चुनें (Trade के लिए):", strikes_list, index=strikes_list.index(atm_strike))
+sel_row = view_df[view_df["strike"] == sel_strike].iloc[0]
 
-for _, r in curr_df.iterrows():
-    strike = int(r["strike"])
-    is_atm = (strike == atm_strike)
+if qt2.button(f"Sell CE ₹{sel_row['ce_ltp']}", type="primary", use_container_width=True):
+    add_trade(sel_strike, "CE", "SELL", sel_row["ce_ltp"]); st.rerun()
+if qt3.button(f"Buy CE ₹{sel_row['ce_ltp']}", use_container_width=True):
+    add_trade(sel_strike, "CE", "BUY", sel_row["ce_ltp"]); st.rerun()
+if qt4.button(f"Sell PE ₹{sel_row['pe_ltp']}", type="primary", use_container_width=True):
+    add_trade(sel_strike, "PE", "SELL", sel_row["pe_ltp"]); st.rerun()
+if qt5.button(f"Buy PE ₹{sel_row['pe_ltp']}", use_container_width=True):
+    add_trade(sel_strike, "PE", "BUY", sel_row["pe_ltp"]); st.rerun()
 
-    c1, c2, c3, c4, c5 = st.columns([1.4, 1.3, 1.1, 1.3, 1.4])
+oc_table = pd.DataFrame({
+    "CE OI": view_df["ce_oi"].apply(lambda x: f"{x:,}"),
+    "CE Chg OI": view_df["ce_coi"].apply(lambda x: f"{x:+,}"),
+    "CE LTP": view_df["ce_ltp"].apply(lambda x: f"₹{x:.2f}"),
+    "STRIKE": view_df["strike"].apply(lambda x: f"⭐ {x} (ATM)" if x == atm_strike else f"{x}"),
+    "PE LTP": view_df["pe_ltp"].apply(lambda x: f"₹{x:.2f}"),
+    "PE Chg OI": view_df["pe_coi"].apply(lambda x: f"{x:+,}"),
+    "PE OI": view_df["pe_oi"].apply(lambda x: f"{x:,}"),
+})
 
-    # CE Info
-    c1.markdown(f"**₹{r['ce_ltp']}**  \nOI: {r['ce_oi']/100000:.1f}L ({r['ce_coi']/1000:+.0f}K)")
-
-    # CE Buy / Sell
-    cb1, cb2 = c2.columns(2)
-    if cb1.button("B", key=f"bce_{strike}"):
-        add_trade(strike, "CE", "BUY", r["ce_ltp"]); st.rerun()
-    if cb2.button("S", key=f"sce_{strike}", type="primary"):
-        add_trade(strike, "CE", "SELL", r["ce_ltp"]); st.rerun()
-
-    # Strike
-    if is_atm:
-        c3.markdown(f"**:orange[⭐ {strike}]**")
-    else:
-        c3.markdown(f"**{strike}**")
-
-    # PE Buy / Sell
-    pb1, pb2 = c4.columns(2)
-    if pb1.button("B", key=f"bpe_{strike}"):
-        add_trade(strike, "PE", "BUY", r["pe_ltp"]); st.rerun()
-    if pb2.button("S", key=f"spe_{strike}", type="primary"):
-        add_trade(strike, "PE", "SELL", r["pe_ltp"]); st.rerun()
-
-    # PE Info
-    c5.markdown(f"**₹{r['pe_ltp']}**  \nOI: {r['pe_oi']/100000:.1f}L ({r['pe_coi']/1000:+.0f}K)")
+st.dataframe(oc_table, use_container_width=True, hide_index=True, height=770)
