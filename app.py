@@ -1,4 +1,10 @@
 import streamlit as st
+
+mode = st.radio("Select Mode:", ["🚀 Live/Paper Algo Terminal", "📊 Manual Options Simulator"], horizontal=True)
+if mode == "📊 Manual Options Simulator":
+    exec(open("pages/simulator.py", encoding="utf-8").read())
+    st.stop()
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
