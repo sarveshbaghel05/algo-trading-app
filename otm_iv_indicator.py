@@ -1,5 +1,6 @@
 import math
 from datetime import datetime
+import pytz
 import streamlit as st
 
 def _norm_cdf(x):
@@ -15,11 +16,22 @@ def _bs_price(S, K, T, r, sigma, option_type="CE"):
     else:
         return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
 
-def calculate_otm_iv(ltp, spot, strike, expiry_dt, option_type="CE", r=0.07):
+def calculate_otm_iv(ltp, spot, strike, expiry_str, option_type="CE", r=0.065):
+    """केवल OTM ऑप्शन के LTP और एक्सपायरी तारीख से सटीक IV (%) निकालता है"""
     if ltp <= 0.5 or spot <= 0:
         return 0.0
-    now = datetime.now()
-    seconds_left = max((expiry_dt - now).total_seconds(), 3600)
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+
+    try:
+        exp_dt = datetime.strptime(expiry_str, "%d-%b-%Y").replace(hour=15, minute=30)
+        exp_dt = ist.localize(exp_dt)
+        seconds_left = max((exp_dt - now_ist).total_seconds(), 3600)
+    except Exception:
+        # अगर Demo Mode हो तो 2 दिन मान लें
+        seconds_left = 2 * 24 * 3600
+
     T = seconds_left / (365.0 * 24 * 3600)
 
     low, high = 0.01, 3.0
@@ -32,10 +44,10 @@ def calculate_otm_iv(ltp, spot, strike, expiry_dt, option_type="CE", r=0.07):
             high = mid
     return round(((low + high) / 2.0) * 100, 2)
 
-def evaluate_otm_iv_indicator(symbol, spot_price, option_chain_data, expiry_dt):
-    if symbol == "NIFTY":
+def evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label):
+    if selected_idx == "Nifty 50":
         step, hedge_dist = 50, 300
-    elif symbol == "BANKNIFTY":
+    elif selected_idx == "Bank Nifty":
         step, hedge_dist = 100, 300
     else:
         step, hedge_dist = 100, 1000
@@ -46,35 +58,35 @@ def evaluate_otm_iv_indicator(symbol, spot_price, option_chain_data, expiry_dt):
     otm_ce_strikes = [atm_strike + step, atm_strike + 2 * step, atm_strike + 3 * step]
     otm_pe_strikes = [atm_strike - step, atm_strike - 2 * step, atm_strike - 3 * step]
 
-    chain_map = {row["strike"]: row for row in option_chain_data}
+    up_3_df = full_df[full_df["STRIKE"].isin(otm_ce_strikes)]
+    down_3_df = full_df[full_df["STRIKE"].isin(otm_pe_strikes)]
 
-    top3_ce_chg_oi = 0
+    top3_ce_chg_oi = int(up_3_df["CALL CHG OI"].sum()) if not up_3_df.empty else 0
+    bottom3_pe_chg_oi = int(down_3_df["PUT CHG OI"].sum()) if not down_3_df.empty else 0
+
     top3_ce_ivs = []
-    for s in otm_ce_strikes:
-        if s in chain_map:
-            top3_ce_chg_oi += chain_map[s].get("ce_chg_oi", 0)
-            iv = calculate_otm_iv(chain_map[s]["ce_ltp"], spot_price, s, expiry_dt, "CE")
-            if iv > 0:
-                top3_ce_ivs.append(iv)
+    for _, row in up_3_df.iterrows():
+        iv = calculate_otm_iv(float(row["CALL LTP"]), spot_price, int(row["STRIKE"]), expiry_label, "CE")
+        if iv > 0:
+            top3_ce_ivs.append(iv)
 
-    bottom3_pe_chg_oi = 0
     bottom3_pe_ivs = []
-    for s in otm_pe_strikes:
-        if s in chain_map:
-            bottom3_pe_chg_oi += chain_map[s].get("pe_chg_oi", 0)
-            iv = calculate_otm_iv(chain_map[s]["pe_ltp"], spot_price, s, expiry_dt, "PE")
-            if iv > 0:
-                bottom3_pe_ivs.append(iv)
+    for _, row in down_3_df.iterrows():
+        iv = calculate_otm_iv(float(row["PUT LTP"]), spot_price, int(row["STRIKE"]), expiry_label, "PE")
+        if iv > 0:
+            bottom3_pe_ivs.append(iv)
 
     avg_otm_ce_iv = round(sum(top3_ce_ivs) / len(top3_ce_ivs), 2) if top3_ce_ivs else 0.0
     avg_otm_pe_iv = round(sum(bottom3_pe_ivs) / len(bottom3_pe_ivs), 2) if bottom3_pe_ivs else 0.0
 
     # पिछले 15 मिनट का IV रिकॉर्ड रखने के लिए
-    state_key = f"otm_iv_hist_{symbol}"
+    ist = pytz.timezone('Asia/Kolkata')
+    now_min = datetime.now(ist).strftime("%H:%M")
+    state_key = f"otm_iv_hist_{selected_idx}"
+
     if state_key not in st.session_state:
         st.session_state[state_key] = []
 
-    now_min = datetime.now().strftime("%H:%M")
     hist = st.session_state[state_key]
     if not hist or hist[-1]["time"] != now_min:
         hist.append({"time": now_min, "ce_iv": avg_otm_ce_iv, "pe_iv": avg_otm_pe_iv})
@@ -97,20 +109,18 @@ def evaluate_otm_iv_indicator(symbol, spot_price, option_chain_data, expiry_dt):
         "avg_otm_pe_iv": avg_otm_pe_iv,
         "ce_iv_change": ce_iv_change,
         "pe_iv_change": pe_iv_change,
-        "top3_ce_chg_oi": top3_ce_chg_oi,
-        "bottom3_pe_chg_oi": bottom3_pe_chg_oi,
         "message": ""
     }
 
-    # Bull Put Spread लॉजिक (जब नीचे पुट राइटिंग ज़्यादा हो)
+    # Bull Put Spread (जब नीचे की 3 स्ट्राइक्स में Put Change in OI ज़्यादा हो)
     if bottom3_pe_chg_oi > top3_ce_chg_oi * 1.15:
         if pe_iv_change <= -0.15:
             decision.update({
                 "signal": "BUY_SIGNAL",
-                "spread_name": "BULL PUT SPREAD (तेज़ी का ट्रेंड)",
+                "spread_name": "BULL PUT SPREAD (मजबूत अपट्रेंड)",
                 "sell_leg": f"{atm_strike} PE",
                 "buy_hedge": f"{atm_strike - hedge_dist} PE",
-                "message": f"Put Chg OI ज़्यादा है और OTM Put IV {abs(pe_iv_change)}% गिरा है (असली अपट्रेंड कन्फर्म)।"
+                "message": f"नीचे की 3 स्ट्राइक्स में Put Chg OI ज़्यादा है और OTM Put IV {abs(pe_iv_change)}% गिरा है (असली अपट्रेंड कन्फर्म)।"
             })
         elif pe_iv_change > 0.25:
             decision.update({
@@ -122,18 +132,18 @@ def evaluate_otm_iv_indicator(symbol, spot_price, option_chain_data, expiry_dt):
             decision.update({
                 "signal": "WAIT",
                 "spread_name": "Bull Put Spread (IV गिरने का इंतज़ार)",
-                "message": f"Put Chg OI ज़्यादा है, पर OTM Put IV अभी गिरना शुरू नहीं हुआ ({pe_iv_change}%)।"
+                "message": f"Put Chg OI ज़्यादा है, पर OTM Put IV अभी गिरना शुरू नहीं हुआ ({pe_iv_change:+}%)।"
             })
 
-    # Bear Call Spread लॉजिक (जब ऊपर कॉल राइटिंग ज़्यादा हो)
+    # Bear Call Spread (जब ऊपर की 3 स्ट्राइक्स में Call Change in OI ज़्यादा हो)
     elif top3_ce_chg_oi > bottom3_pe_chg_oi * 1.15:
         if ce_iv_change <= -0.15:
             decision.update({
                 "signal": "BUY_SIGNAL",
-                "spread_name": "BEAR CALL SPREAD (मंदी का ट्रेंड)",
+                "spread_name": "BEAR CALL SPREAD (मजबूत डाउनट्रेंड)",
                 "sell_leg": f"{atm_strike} CE",
                 "buy_hedge": f"{atm_strike + hedge_dist} CE",
-                "message": f"Call Chg OI ज़्यादा है और OTM Call IV {abs(ce_iv_change)}% गिरा है (असली डाउनट्रेंड कन्फर्म)।"
+                "message": f"ऊपर की 3 स्ट्राइक्स में Call Chg OI ज़्यादा है और OTM Call IV {abs(ce_iv_change)}% गिरा है (असली डाउनट्रेंड कन्फर्म)।"
             })
         elif ce_iv_change > 0.25:
             decision.update({
@@ -145,9 +155,9 @@ def evaluate_otm_iv_indicator(symbol, spot_price, option_chain_data, expiry_dt):
             decision.update({
                 "signal": "WAIT",
                 "spread_name": "Bear Call Spread (IV गिरने का इंतज़ार)",
-                "message": f"Call Chg OI ज़्यादा है, पर OTM Call IV अभी गिरना शुरू नहीं हुआ ({ce_iv_change}%)।"
+                "message": f"Call Chg OI ज़्यादा है, पर OTM Call IV अभी गिरना शुरू नहीं हुआ ({ce_iv_change:+}%)।"
             })
     else:
-        decision["message"] = "ऊपर और नीचे की 3 स्ट्राइक्स का Change in OI लगभग बराबर है।"
+        decision["message"] = "ऊपर और नीचे की 3 स्ट्राइक्स का Change in OI लगभग बराबर है — स्पष्ट ट्रेंड नहीं।"
 
     return decision
