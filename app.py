@@ -18,6 +18,13 @@ from datetime import datetime, timedelta
 import pytz
 from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 
+# GitHub स्थायी बैकअप के लिए helper फ़ंक्शन लोड करना
+try:
+    from github_storage import load_from_github, save_to_github
+    HAS_GH_STORAGE = True
+except Exception:
+    HAS_GH_STORAGE = False
+
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
 
@@ -25,6 +32,17 @@ HISTORY_FILE = "paper_trades_history.csv"
 OC_RECORD_FILE = "recorded_oc_history.csv"
 
 def load_trade_history():
+    # 1. पहले GitHub से स्थायी ट्रेड हिस्ट्री लोड करने की कोशिश करें
+    if HAS_GH_STORAGE:
+        try:
+            gh_records = load_from_github(HISTORY_FILE)
+            if isinstance(gh_records, list) and len(gh_records) > 0:
+                pd.DataFrame(gh_records).to_csv(HISTORY_FILE, index=False)
+                return gh_records
+        except Exception:
+            pass
+
+    # 2. अगर GitHub से डेटा न मिले, तो लोकल CSV से पढ़ें
     if os.path.exists(HISTORY_FILE):
         try:
             df = pd.read_csv(HISTORY_FILE)
@@ -35,9 +53,17 @@ def load_trade_history():
 
 def save_trade_history(history_list):
     try:
-        pd.DataFrame(history_list).to_csv(HISTORY_FILE, index=False)
+        df = pd.DataFrame(history_list)
+        df.to_csv(HISTORY_FILE, index=False)
     except Exception:
         pass
+
+    # साथ ही GitHub पर भी तुरंत बैकअप सेव करें ताकि ऐप रीस्टार्ट होने पर डेटा न उड़े
+    if HAS_GH_STORAGE:
+        try:
+            save_to_github(HISTORY_FILE, history_list, "Update paper trades history")
+        except Exception:
+            pass
 
 def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
     """लाइव मार्केट (9:15 AM - 3:30 PM) में हर 1 मिनट का असली Option Chain डेटा सेव करना"""
@@ -680,7 +706,8 @@ with tab1:
     with c_auto1:
         auto_10am = st.toggle("⏰ सुबह 10:00 AM पर ऑटो-एंट्री चालू रखें (ऊपर 3 vs नीचे 3 Chg OI)", value=False)
     with c_auto2:
-        st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` | 🛑 **Auto Stop-Loss:** `₹{2000 * algo_lots:,.0f}` (`₹2,000/Lot`)")
+        gh_badge = "☁️ GitHub Sync ON" if HAS_GH_STORAGE else "💾 Local CSV"
+        st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` ({gh_badge}) | 🛑 **Auto SL:** `₹{2000 * algo_lots:,.0f}`")
 
     @st.fragment(run_every=10)
     def render_algo_dashboard(mode_sel, selected_idx, lots_cnt, is_unlocked, is_auto_10):
@@ -860,8 +887,7 @@ with tab1:
                 if st.button("🗑️ हिस्ट्री साफ करें", key="clear_hist_btn"):
                     st.session_state["trade_history"] = []
                     st.session_state["paper_capital"] = 200000.0
-                    if os.path.exists(HISTORY_FILE):
-                        os.remove(HISTORY_FILE)
+                    save_trade_history([])
                     st.rerun()
             hist_df = pd.DataFrame(st.session_state["trade_history"])
             st.dataframe(hist_df, use_container_width=True, hide_index=True, key="saved_history_table")
