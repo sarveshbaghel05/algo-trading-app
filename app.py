@@ -30,7 +30,7 @@ OC_RECORD_FILE = "recorded_oc_history.csv"
 DEFAULT_GH_REPO = "Sarveshbaghel05/algo-trading-app"
 
 # ==========================================
-# Direct GitHub Permanent Storage (Trade aur History Save karne ke liye)
+# Direct GitHub Permanent Storage
 # ==========================================
 def _get_gh_config():
     try:
@@ -43,7 +43,7 @@ def _get_gh_config():
 def gh_read_file(filepath):
     token, repo = _get_gh_config()
     if not token:
-        return None, None, "GITHUB_TOKEN Secret nahi mila"
+        return None, None, "GITHUB_TOKEN Secret नहीं मिला"
     url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -1322,4 +1322,52 @@ with tab3:
 
                             worst_spot = float(row['Low']) if is_bull_put else float(row['High'])
                             curr_sell = bs_option_price(worst_spot, sell_k, t_curr, daily_iv, opt_type)
-                            curr_buy = bs_option_price(worst_spot, buy_k, t
+                            curr_buy = bs_option_price(worst_spot, buy_k, t_curr, daily_iv, opt_type)
+
+                            unrealized_rs = ((sell_entry - curr_sell) + (curr_buy - buy_entry)) * total_qty
+                            if unrealized_rs <= -total_sl_rs:
+                                exit_status = f"SL Hit ❌ ({ts.strftime('%I:%M %p')})"
+                                final_sell_exit = curr_sell + (max(0.5, curr_sell * 0.008) * slip_mult)
+                                final_buy_exit = max(0.05, curr_buy - (max(0.5, curr_buy * 0.012) * slip_mult))
+                                break
+
+                        if exit_status == "3:15 Exit ✅":
+                            close_spot = float(trade_session['Close'].iloc[-1])
+                            t_close = (days_to_exp + (15.0 / 375.0)) / 365.0
+                            c_sell = bs_option_price(close_spot, sell_k, t_close, daily_iv, opt_type)
+                            c_buy = bs_option_price(close_spot, buy_k, t_close, daily_iv, opt_type)
+                            final_sell_exit = c_sell + (max(0.5, c_sell * 0.004) * slip_mult)
+                            final_buy_exit = max(0.05, c_buy - (max(0.5, c_buy * 0.012) * slip_mult))
+
+                        gross_pnl_rs = ((sell_entry - final_sell_exit) + (final_buy_exit - buy_entry)) * total_qty
+                        costs_rs = calc_roundtrip_charges(sell_entry, final_sell_exit, buy_entry, final_buy_exit, total_qty) if deduct_costs else 0.0
+                        day_pnl_rs = round(gross_pnl_rs - costs_rs, 0)
+                        day_pts = round(day_pnl_rs / total_qty, 1)
+
+                        trade_logs.append({
+                            "तारीख": str(dt),
+                            "10:00 Spot": round(spot_1000, 1),
+                            trade_col_name: legs_text,
+                            "नतीजा": exit_status,
+                            "नेट पॉइंट्स": day_pts,
+                            "लाभ / हानि (₹)": day_pnl_rs
+                        })
+
+        res_df = pd.DataFrame(trade_logs)
+        if not res_df.empty:
+            res_df["कुल पूंजी बदलाव (₹)"] = res_df["लाभ / हानि (₹)"].cumsum()
+            total_pnl = res_df["लाभ / हानि (₹)"].sum()
+            win_days = len(res_df[res_df["लाभ / हानि (₹)"] > 0])
+            win_rate = round((win_days / len(res_df)) * 100, 1)
+            max_dd = round((res_df["कुल पूंजी बदलाव (₹)"].cummax() - res_df["कुल पूंजी बदलाव (₹)"]).max(), 0)
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("कुल शुद्ध लाभ / हानि", f"₹{total_pnl:,.0f}", f"{len(res_df)} ट्रेडिंग दिन")
+            r2.metric("Win Rate", f"{win_rate}%", f"{win_days} जीत / {len(res_df)-win_days} हार")
+            r3.metric("Max Drawdown", f"-₹{int(max_dd):,}", "अधिकतम गिरावट")
+            r4.metric("Stop-Loss", f"₹{int(total_sl_rs):,} / दिन", f"{hedge_points} pts Hedge")
+
+            st.line_chart(res_df.set_index("तारीख")["कुल पूंजी बदलाव (₹)"])
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+# === END OF APP.PY ===
