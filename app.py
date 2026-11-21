@@ -16,7 +16,7 @@ import os
 import math
 from datetime import datetime, timedelta
 import pytz
-from otm_iv_indicator import evaluate_otm_iv_from_df
+from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -973,7 +973,7 @@ with tab2:
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
         st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
-        # --- नया OTM 3-Strike IV इंडिकेटर (otm_iv_indicator.py से) ---
+        # --- नया OTM 3-Strike IV इंडिकेटर (pages/otm_iv_indicator.py से) ---
         iv_info = evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label)
 
         iv_c1, iv_c2, iv_c3 = st.columns(3)
