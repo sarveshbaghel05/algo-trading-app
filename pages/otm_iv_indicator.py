@@ -2,6 +2,7 @@ import math
 from datetime import datetime
 import pytz
 import pandas as pd
+import requests
 import streamlit as st
 
 def _norm_cdf(x):
@@ -162,92 +163,85 @@ def evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label):
 
 
 # ==========================================
-# STREAMLIT UI (ताकि पेज स्क्रीन पर दिखे)
+# STANDALONE PAGE UI (जब Sidebar से सीधे यह पेज खोला जाए)
 # ==========================================
-def render_iv_page():
-    st.set_page_config(page_title="OTM IV Indicator", layout="wide")
-    st.title("📊 OTM IV + Change in OI Indicator")
-    st.caption("10:00 AM Option Selling Confirmation Filter (Fake Breakout Detector)")
+def render_standalone_iv_page():
+    st.title("📊 OTM 3-Strike IV + Change in OI Indicator")
+    st.caption("Angel One Live Option Chain से जुड़ा हुआ (Fake Breakout & IV Crush Filter)")
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        selected_idx = st.selectbox("Index चुनें", ["Nifty 50", "Bank Nifty", "Sensex"])
-    with col2:
-        demo_scenario = st.selectbox(
-            "Test Mode (बाज़ार बंद होने पर टेस्ट करें)",
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        selected_idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty", "Sensex"], key="iv_page_idx")
+    with c2:
+        data_source_mode = st.radio("डेटा मोड:", ["🔴 Angel One Live", "🟡 Offline Test Mode"], horizontal=True)
+
+    if selected_idx == "Nifty 50":
+        step, default_spot = 50, 23500.0
+    elif selected_idx == "Bank Nifty":
+        step, default_spot = 100, 50500.0
+    else:
+        step, default_spot = 100, 77500.0
+
+    spot = default_spot
+    expiry_label = "DEMO"
+    is_live_loaded = False
+    df_oc = pd.DataFrame()
+
+    # अगर Angel One Live चुना है और main app से फंक्शन उपलब्ध है तो लाइव डेटा लें
+    if "Live" in data_source_mode:
+        try:
+            from app import fetch_angel_live_oc
+            if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+                live_df, live_spot, exp_str, _, err = fetch_angel_live_oc(
+                    st.session_state["angel_jwt"], st.session_state["angel_key"], selected_idx, 5
+                )
+                if live_df is not None and not live_df.empty:
+                    df_oc = live_df
+                    spot = live_spot
+                    expiry_label = exp_str
+                    is_live_loaded = True
+        except Exception:
+            pass
+
+    if not is_live_loaded:
+        if "Live" in data_source_mode:
+            st.info("ℹ️ अभी बाज़ार बंद है या मुख्य पेज से Angel One लॉगिन सक्रिय नहीं है — नीचे **Offline Test Mode** दिखाया जा रहा है।")
+        demo_type = st.selectbox(
+            "Test Scenario चुनें:",
             ["Bull Put Spread (Real Uptrend)", "Put Writers Trap (Fake Breakout)", "Bear Call Spread (Real Downtrend)", "Sideways / Wait"]
         )
+        strikes = [int(default_spot + i * step) for i in range(-4, 5)]
+        if "Bull Put" in demo_type:
+            ce_oi, pe_oi, ce_ltp, pe_ltp, sim_ce, sim_pe = 12000, 46000, 110.0, 95.0, 0.05, -0.35
+        elif "Put Writers Trap" in demo_type:
+            ce_oi, pe_oi, ce_ltp, pe_ltp, sim_ce, sim_pe = 10000, 52000, 105.0, 130.0, 0.10, 0.45
+        elif "Bear Call" in demo_type:
+            ce_oi, pe_oi, ce_ltp, pe_ltp, sim_ce, sim_pe = 49000, 11000, 90.0, 115.0, -0.30, 0.05
+        else:
+            ce_oi, pe_oi, ce_ltp, pe_ltp, sim_ce, sim_pe = 20000, 21000, 110.0, 110.0, 0.0, 0.0
 
-    # Index के हिसाब से Spot और Step सेट करें
-    if selected_idx == "Nifty 50":
-        spot, step = 23500, 50
-    elif selected_idx == "Bank Nifty":
-        spot, step = 50500, 100
+        df_oc = pd.DataFrame({
+            "STRIKE": strikes,
+            "CALL CHG OI": [ce_oi] * len(strikes),
+            "PUT CHG OI": [pe_oi] * len(strikes),
+            "CALL LTP": [max(10.0, ce_ltp - abs(s - default_spot) * 0.25) for s in strikes],
+            "PUT LTP": [max(10.0, pe_ltp - abs(s - default_spot) * 0.25) for s in strikes],
+        })
+        res = evaluate_otm_iv_from_df(selected_idx, default_spot, df_oc, "DEMO")
+        res["ce_iv_change"] = sim_ce
+        res["pe_iv_change"] = sim_pe
+        if res["bottom3_pe_chg_oi"] > res["top3_ce_chg_oi"] * 1.15:
+            if sim_pe <= -0.15:
+                res.update({"signal": "BUY_SIGNAL", "spread_name": "BULL PUT SPREAD (मजबूत अपट्रेंड)", "sell_leg": f"{int(default_spot)} PE", "buy_hedge": f"{int(default_spot - (1000 if selected_idx=='Sensex' else 300))} PE", "message": f"नीचे की 3 स्ट्राइक्स में Put Chg OI ज़्यादा है और OTM Put IV {abs(sim_pe)}% गिरा है (असली अपट्रेंड कन्फर्म)।"})
+            elif sim_pe > 0.25:
+                res.update({"signal": "TRAP", "spread_name": "ट्रेड न लें (Put Writers Trap)", "message": f"Put Chg OI ज़्यादा है, पर OTM Put IV +{sim_pe}% बढ़ रहा है — नीचे पलटने का खतरा!"})
+        elif res["top3_ce_chg_oi"] > res["bottom3_pe_chg_oi"] * 1.15 and sim_ce <= -0.15:
+            res.update({"signal": "BUY_SIGNAL", "spread_name": "BEAR CALL SPREAD (मजबूत डाउनट्रेंड)", "sell_leg": f"{int(default_spot)} CE", "buy_hedge": f"{int(default_spot + (1000 if selected_idx=='Sensex' else 300))} CE", "message": f"ऊपर की 3 स्ट्राइक्स में Call Chg OI ज़्यादा है और OTM Call IV {abs(sim_ce)}% गिरा है (असली डाउनट्रेंड कन्फर्म)।"})
     else:
-        spot, step = 77500, 100
-
-    # Demo Option Chain डेटा तैयार करें
-    strikes = [spot + i * step for i in range(-4, 5)]
-    if "Bull Put" in demo_scenario:
-        ce_oi_chg = [12000] * len(strikes)
-        pe_oi_chg = [45000] * len(strikes)
-        ce_ltp_base, pe_ltp_base = 110.0, 95.0
-        sim_pe_shift = -0.35
-        sim_ce_shift = 0.05
-    elif "Put Writers Trap" in demo_scenario:
-        ce_oi_chg = [10000] * len(strikes)
-        pe_oi_chg = [50000] * len(strikes)
-        ce_ltp_base, pe_ltp_base = 105.0, 130.0
-        sim_pe_shift = 0.45
-        sim_ce_shift = 0.10
-    elif "Bear Call" in demo_scenario:
-        ce_oi_chg = [48000] * len(strikes)
-        pe_oi_chg = [11000] * len(strikes)
-        ce_ltp_base, pe_ltp_base = 90.0, 115.0
-        sim_pe_shift = 0.05
-        sim_ce_shift = -0.30
-    else:
-        ce_oi_chg = [20000] * len(strikes)
-        pe_oi_chg = [21000] * len(strikes)
-        ce_ltp_base, pe_ltp_base = 110.0, 110.0
-        sim_pe_shift = 0.0
-        sim_ce_shift = 0.0
-
-    demo_df = pd.DataFrame({
-        "STRIKE": strikes,
-        "CALL CHG OI": ce_oi_chg,
-        "PUT CHG OI": pe_oi_chg,
-        "CALL LTP": [max(10.0, ce_ltp_base - abs(s - spot) * 0.25) for s in strikes],
-        "PUT LTP": [max(10.0, pe_ltp_base - abs(s - spot) * 0.25) for s in strikes],
-    })
-
-    # Demo के लिए 15 मिनट पहले का IV History सेट करें
-    res = evaluate_otm_iv_from_df(selected_idx, spot, demo_df, "DEMO")
-    res["ce_iv_change"] = sim_ce_shift
-    res["pe_iv_change"] = sim_pe_shift
-
-    # दोबारा सिग्नल अपडेट करें ताकि Demo IV shift दिखे
-    if res["bottom3_pe_chg_oi"] > res["top3_ce_chg_oi"] * 1.15:
-        if sim_pe_shift <= -0.15:
-            res["signal"] = "BUY_SIGNAL"
-            res["spread_name"] = "BULL PUT SPREAD (मजबूत अपट्रेंड)"
-            res["sell_leg"] = f"{spot} PE"
-            res["buy_hedge"] = f"{spot - (1000 if selected_idx=='Sensex' else 300)} PE"
-            res["message"] = f"नीचे की 3 स्ट्राइक्स में Put Chg OI ज़्यादा है और OTM Put IV {abs(sim_pe_shift)}% गिरा है (असली अपट्रेंड कन्फर्म)।"
-        elif sim_pe_shift > 0.25:
-            res["signal"] = "TRAP"
-            res["spread_name"] = "ट्रेड न लें (Put Writers Trap)"
-            res["message"] = f"Put Chg OI ज़्यादा है, पर OTM Put IV +{sim_pe_shift}% बढ़ रहा है — नीचे पलटने का खतरा!"
-    elif res["top3_ce_chg_oi"] > res["bottom3_pe_chg_oi"] * 1.15 and sim_ce_shift <= -0.15:
-        res["signal"] = "BUY_SIGNAL"
-        res["spread_name"] = "BEAR CALL SPREAD (मजबूत डाउनट्रेंड)"
-        res["sell_leg"] = f"{spot} CE"
-        res["buy_hedge"] = f"{spot + (1000 if selected_idx=='Sensex' else 300)} CE"
-        res["message"] = f"ऊपर की 3 स्ट्राइक्स में Call Chg OI ज़्यादा है और OTM Call IV {abs(sim_ce_shift)}% गिरा है (असली डाउनट्रेंड कन्फर्म)।"
+        st.success(f"🟢 **Angel One Live Data Active** | Spot: `{spot:,.2f}` | Expiry: `{expiry_label}`")
+        res = evaluate_otm_iv_from_df(selected_idx, spot, df_oc, expiry_label)
 
     st.divider()
-
-    # Signal Banner
     if res["signal"] == "BUY_SIGNAL":
         st.success(f"### ✅ {res['spread_name']}\n**Sell:** `{res['sell_leg']}` | **Buy Hedge:** `{res['buy_hedge']}`\n\n{res['message']}")
     elif res["signal"] == "TRAP":
@@ -255,15 +249,14 @@ def render_iv_page():
     else:
         st.warning(f"### ⏳ {res['spread_name']}\n{res['message']}")
 
-    # Metrics Row
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Top 3 OTM Call IV", f"{res['avg_otm_ce_iv']}%", f"{res['ce_iv_change']:+}%")
-    m2.metric("Bottom 3 OTM Put IV", f"{res['avg_otm_pe_iv']}%", f"{res['pe_iv_change']:+}%")
-    m3.metric("Top 3 Call Chg OI", f"{res['top3_ce_chg_oi']:,}")
-    m4.metric("Bottom 3 Put Chg OI", f"{res['bottom3_pe_chg_oi']:,}")
+    m1.metric("Top-3 OTM Call IV", f"{res['avg_otm_ce_iv']}%", f"{res['ce_iv_change']:+}%", delta_color="inverse")
+    m2.metric("Bottom-3 OTM Put IV", f"{res['avg_otm_pe_iv']}%", f"{res['pe_iv_change']:+}%", delta_color="inverse")
+    m3.metric("Top-3 Call Chg OI", f"{res['top3_ce_chg_oi']:,}")
+    m4.metric("Bottom-3 Put Chg OI", f"{res['bottom3_pe_chg_oi']:,}")
 
-    with st.expander("देखें: OTM Option Chain डेटा जिस पर कैलकुलेशन हुई है"):
-        st.dataframe(demo_df, use_container_width=True)
+    with st.expander("देखें: Option Chain डेटा (OTM Strikes)"):
+        st.dataframe(df_oc, use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
-    render_iv_page()
+    render_standalone_iv_page()
