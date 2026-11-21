@@ -4,7 +4,7 @@ mode = st.radio("Select Mode:", ["🚀 Live/Paper Algo Terminal", "📊 Manual O
 if mode == "📊 Manual Options Simulator":
     exec(open("pages/simulator.py", encoding="utf-8").read())
     st.stop()
-import streamlit as st
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -16,6 +16,7 @@ import os
 import math
 from datetime import datetime, timedelta
 import pytz
+from otm_iv_indicator import evaluate_otm_iv_from_df
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -43,7 +44,6 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
     try:
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
-        # सिर्फ मार्केट टाइम (सोमवार से शुक्रवार, 9:15 से 15:30) में रिकॉर्ड करें
         if now_ist.weekday() >= 5:
             return
         curr_mins = now_ist.hour * 60 + now_ist.minute
@@ -428,7 +428,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     final_cols = ["CALL VOL", "CALL CHG OI", "CALL OI", "CALL LTP", "STRIKE", "PUT LTP", "PUT OI", "PUT CHG OI", "PUT VOL"]
     final_df = df[final_cols]
 
-    # हर 1 मिनट का असली डेटा बैकटेस्ट के लिए ऑटो-रिकॉर्ड करना
     record_live_oc_snapshot(selected_idx, spot_price, exp_str, final_df)
 
     return final_df, spot_price, exp_str, contract_map, None
@@ -584,7 +583,7 @@ def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
             res = requests.post(hist_url, json=payload, headers=headers, timeout=15).json()
             if res.get("status") and res.get("data"):
                 all_candles.extend(res["data"])
-            time.sleep(0.15)  # Rate-limit safety for multi-year fetch
+            time.sleep(0.15)
         except Exception:
             break
         end_dt = start_dt - timedelta(minutes=1)
@@ -622,7 +621,7 @@ def calc_roundtrip_charges(sell_entry, sell_exit, buy_entry, buy_exit, qty):
     buy_turnover = (buy_entry + sell_exit) * qty
     total_turnover = sell_turnover + buy_turnover
 
-    brokerage = 80.0  # ₹20 x 4 orders
+    brokerage = 80.0
     stt = sell_turnover * 0.0015
     exch = total_turnover * 0.0003553
     sebi = total_turnover * 0.000001
@@ -640,7 +639,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (अछूता / Unchanged)
+# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE
 # ==========================================
 with tab1:
     st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (⚡ Smooth Live)")
@@ -870,7 +869,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन (अछूता / Unchanged)
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV इंडिकेटर
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -974,6 +973,21 @@ with tab2:
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
         st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
+        # --- नया OTM 3-Strike IV इंडिकेटर (otm_iv_indicator.py से) ---
+        iv_info = evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label)
+
+        iv_c1, iv_c2, iv_c3 = st.columns(3)
+        iv_c1.metric("Top-3 OTM Call IV", f"{iv_info['avg_otm_ce_iv']}%", f"{iv_info['ce_iv_change']:+}%", delta_color="inverse")
+        iv_c2.metric("Bottom-3 OTM Put IV", f"{iv_info['avg_otm_pe_iv']}%", f"{iv_info['pe_iv_change']:+}%", delta_color="inverse")
+        iv_c3.metric("IV ट्रेंड सिग्नल", iv_info["signal"])
+
+        if iv_info["signal"] == "BUY_SIGNAL":
+            st.success(f"✅ **{iv_info['spread_name']}** | Sell: `{iv_info['sell_leg']}` | Buy Hedge: `{iv_info['buy_hedge']}` — {iv_info['message']}")
+        elif iv_info["signal"] == "TRAP":
+            st.error(f"🚨 **{iv_info['spread_name']}** — {iv_info['message']}")
+        else:
+            st.info(f"⏳ **{iv_info['spread_name']}** — {iv_info['message']}")
+
         def style_seller_chain(row):
             styles = [''] * len(row)
             is_atm = (row['STRIKE'] == atm_strike)
@@ -1005,7 +1019,7 @@ with tab2:
     render_seller_chain(idx, strike_range)
 
 # ==========================================
-# TAB 3: सुबह 10:00 AM Change in OI — High-Accuracy Backtest (Up to 5 Years + Recorded Data)
+# TAB 3: सुबह 10:00 AM Change in OI — High-Accuracy Backtest
 # ==========================================
 with tab3:
     st.subheader("🎯 सुबह 10:00 AM — High-Accuracy बैकटेस्ट (1-Min Spot + Black-Scholes + Net Brokerage)")
@@ -1054,19 +1068,16 @@ with tab3:
 
     if st.button("🚀 सटीक बैकटेस्ट चलाएं (Run Accurate Backtest)", use_container_width=True):
         if bt_idx == "Nifty 50":
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 300, 3, 0.135  # Thursday
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 300, 3, 0.135
         elif bt_idx == "Bank Nifty":
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 300, 2, 0.165  # Wednesday
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 300, 2, 0.165
         else:
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1000, 4, 0.145  # Friday
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1000, 4, 0.145
 
         total_qty = lot_qty * lots
         trade_col_name = f"ट्रेड (ATM + {hedge_points} Hedge)"
         trade_logs = []
 
-        # ==========================================
-        # MODE A: 100% असली रिकॉर्डेड Option Chain डेटा पर बैकटेस्ट
-        # ==========================================
         if "रिकॉर्डेड" in bt_source:
             if not os.path.exists(OC_RECORD_FILE):
                 st.warning("अभी तक कोई रिकॉर्डेड डेटा फाइल नहीं बनी है। लाइव मार्केट के दौरान ऐप खोलें, डेटा अपने आप सेव होने लगेगा।")
@@ -1136,9 +1147,6 @@ with tab3:
                             "लाभ / हानि (₹)": net_rs
                         })
 
-        # ==========================================
-        # MODE B: Angel One 1-Min Spot + Black-Scholes & Expiry Theta Model (Up to 5 Years)
-        # ==========================================
         else:
             days_num = int(bt_days.split(" ")[0])
             with st.spinner(f"Angel One SmartAPI से {days_num} दिनों का 1-मिनट असली स्पॉट डेटा लोड हो रहा है (बड़े डेटा में 10–25 सेकंड लग सकते हैं)..."):
@@ -1176,14 +1184,11 @@ with tab3:
                         spot_1000 = float(trade_session['Open'].iloc[0])
                         atm_1000 = round(spot_1000 / step) * step
 
-                        # सुबह की वास्तविक वोलैटिलिटी (Realized Intraday IV) निकालना
                         morning_range_pct = max(0.0025, (high_959 - low_959) / spot_1000)
                         daily_iv = min(0.32, max(base_iv * 0.85, morning_range_pct * 16.0))
 
-                        # Expiry तक बचे हुए दिन (असली साप्ताहिक एक्सपायरी कैलेंडर के अनुसार)
                         days_to_exp = (expiry_weekday - dt.weekday()) % 7
 
-                        # सुबह 9:15 से 10:00 के प्राइस एक्शन और क्लोजिंग पोजिशन से Writer Pressure तय करना
                         morning_move = spot_1000 - open_915
                         is_bull_put = (morning_move >= 0)
 
@@ -1198,12 +1203,10 @@ with tab3:
                             buy_k = atm_1000 + hedge_points
                             legs_text = f"Sell {sell_k} CE / Buy {buy_k} CE"
 
-                        # 10:00 AM पर Black-Scholes Entry Premium (315 मिनट शेष दिन में)
                         t_entry = (days_to_exp + (315.0 / 375.0)) / 365.0
                         raw_sell_entry = bs_option_price(spot_1000, sell_k, t_entry, daily_iv, opt_type)
                         raw_buy_entry = bs_option_price(spot_1000, buy_k, t_entry, daily_iv, opt_type)
 
-                        # Entry Slippage (ATM पर 0.4%, OTM Hedge पर 1.2%)
                         slip_mult = 1.0 if deduct_costs else 0.0
                         sell_entry = round(raw_sell_entry - (max(0.5, raw_sell_entry * 0.004) * slip_mult), 2)
                         buy_entry = round(raw_buy_entry + (max(0.5, raw_buy_entry * 0.012) * slip_mult), 2)
@@ -1214,11 +1217,9 @@ with tab3:
                         total_bars = len(trade_session)
 
                         for idx_bar, (ts, row) in enumerate(trade_session.iterrows()):
-                            # हर मिनट के साथ Expiry के करीब जाने वाला असली Time Decay
                             mins_left_today = max(15.0, 315.0 * (1.0 - (idx_bar / max(1, total_bars - 1))))
                             t_curr = (days_to_exp + (mins_left_today / 375.0)) / 365.0
 
-                            # इंट्राडे में सबसे खराब स्पॉट प्राइस (Worst Price Check for SL)
                             worst_spot = float(row['Low']) if is_bull_put else float(row['High'])
                             curr_sell = bs_option_price(worst_spot, sell_k, t_curr, daily_iv, opt_type)
                             curr_buy = bs_option_price(worst_spot, buy_k, t_curr, daily_iv, opt_type)
