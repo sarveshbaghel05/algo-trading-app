@@ -20,6 +20,7 @@ from io import StringIO
 from datetime import datetime, timedelta
 import pytz
 from pages.otm_iv_indicator import evaluate_otm_iv_from_df
+from pages.greeks_regime_indicator import evaluate_greeks_regime
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -802,15 +803,17 @@ with tab1:
         is_live_api = False
         full_df = None
         spot_price = default_spot
+        expiry_label = "Simulation"
         contract_map = {}
 
         if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
-            live_df, live_spot, _, c_map, err = fetch_angel_live_oc(
+            live_df, live_spot, exp_date, c_map, err = fetch_angel_live_oc(
                 st.session_state["angel_jwt"], st.session_state["angel_key"], selected_idx, 5
             )
             if live_df is not None and not live_df.empty:
                 full_df = live_df
                 spot_price = live_spot
+                expiry_label = exp_date
                 contract_map = c_map
                 is_live_api = True
 
@@ -829,6 +832,17 @@ with tab1:
                 "CALL LTP": [max(5.0, round(max(0, spot_price - s) + 75, 1)) for s in strikes_t],
                 "PUT LTP": [max(5.0, round(max(0, s - spot_price) + 75, 1)) for s in strikes_t]
             })
+
+        # --- साफ़ हिंदी में बाज़ार की दिशा बैनर (ऊपर / नीचे / साइडवेज) ---
+        g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label)
+        st.markdown(f"""
+        <div style="background: {g_info['bg_color']}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin-bottom: 14px;">
+            <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
+            <div style="font-size: 22px; font-weight: bold; margin-bottom: 4px;">{g_info['headline']}</div>
+            <div style="font-size: 13px; color: #e2e8f0; margin-bottom: 6px;">{g_info['sub_headline']}</div>
+            <div style="font-size: 14px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
         atm_strike = round(spot_price / step) * step
 
@@ -969,7 +983,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV इंडिकेटर
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV + Greeks दिशा बैनर
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -1073,7 +1087,7 @@ with tab2:
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
         st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
-        # --- नया OTM 3-Strike IV इंडिकेटर (pages/otm_iv_indicator.py से) ---
+        # --- नया OTM 3-Strike IV इंडिकेटर ---
         iv_info = evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label)
 
         iv_c1, iv_c2, iv_c3 = st.columns(3)
@@ -1087,6 +1101,23 @@ with tab2:
             st.error(f"🚨 **{iv_info['spread_name']}** — {iv_info['message']}")
         else:
             st.info(f"⏳ **{iv_info['spread_name']}** — {iv_info['message']}")
+
+        # --- साफ़ हिंदी में बाज़ार की दिशा बैनर (ऊपर / नीचे / साइडवेज) ---
+        g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label)
+        st.markdown(f"""
+        <div style="background: {g_info['bg_color']}; padding: 18px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin: 12px 0;">
+            <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
+            <div style="font-size: 24px; font-weight: bold; margin-bottom: 6px;">{g_info['headline']}</div>
+            <div style="font-size: 14px; color: #e2e8f0; margin-bottom: 8px;">{g_info['sub_headline']}</div>
+            <div style="font-size: 15px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Theta/Delta क्षमता", f"{g_info['efficiency_score']}", "3.5 से ऊपर = शांत बाज़ार")
+        g2.metric("ATM रोज़ाना Theta", f"₹{g_info['atm_theta']}/दिन", "प्रीमियम गलन की रफ़्तार")
+        g3.metric("Gamma-IV दबाव", f"{g_info['gamma_iv_risk']} / 100", f"ATM IV: {g_info['atm_iv']}%")
+        g4.metric("नेट ATM Delta", f"{g_info['net_delta']:+}", "+ ऊपर | - नीचे | 0 साइडवेज")
 
         def style_seller_chain(row):
             styles = [''] * len(row)
