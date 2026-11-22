@@ -20,7 +20,11 @@ from io import StringIO
 from datetime import datetime, timedelta
 import pytz
 from pages.otm_iv_indicator import evaluate_otm_iv_from_df
-from pages.greeks_regime_indicator import evaluate_greeks_regime
+
+try:
+    from pages.greek_regime_indicator import evaluate_greeks_regime
+except ImportError:
+    from pages.greeks_regime_indicator import evaluate_greeks_regime
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -124,7 +128,7 @@ def load_active_trade():
     if raw_json:
         try:
             data = json.loads(raw_json)
-            if isinstance(data, dict) and data.get("sell_strike"):
+            if isinstance(data, dict) and (data.get("legs") or data.get("sell_strike")):
                 return data
         except Exception:
             pass
@@ -351,7 +355,10 @@ def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
         "X-MACAddress": "00:00:00:00:00:00",
         "X-PrivateKey": api_key.strip()
     }
-    payload = {"mode": "LTP", "exchangeTokens": {exchange: [str(t) for t in tokens_tuple]}}
+    valid_tokens = [str(t) for t in tokens_tuple if str(t) and str(t) != "0"]
+    if not valid_tokens:
+        return {}
+    payload = {"mode": "LTP", "exchangeTokens": {exchange: valid_tokens}}
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=5).json()
         if res.get("status"):
@@ -418,7 +425,8 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
     exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
-    max_hedge = 1000 if selected_idx == "Sensex" else 300
+    # नए हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
+    max_hedge = {"Nifty 50": 500, "Bank Nifty": 1000, "Sensex": 1500}[selected_idx]
     fetch_span = max(s_range * step, max_hedge + step, 3 * step)
     min_s = atm_strike - fetch_span
     max_s = atm_strike + fetch_span
@@ -531,14 +539,79 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
     return final_df, spot_price, exp_str, contract_map, None
 
-def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell_ltp, buy_ltp, lots, lot_qty, contract_map, trigger_src="Manual"):
+# ==========================================
+# मल्टी-लेग (Bull Put / Bear Call / Straddle + Hedge) एंट्री और एग्जिट इंजन
+# ==========================================
+def build_strategy_plan(direction, selected_idx, atm_strike, hedge_pts, full_df):
+    """दिशा सिग्नल (UP / DOWN / SIDEWAYS) के हिसाब से सही स्ट्राइक और लेग्स तैयार करना"""
+    def _get_ltp(strike_val, side_type):
+        row = full_df[full_df["STRIKE"] == strike_val]
+        col = "CALL LTP" if side_type == "CE" else "PUT LTP"
+        if not row.empty:
+            return float(row[col].iloc[0])
+        return 120.0 if strike_val == atm_strike else 30.0
+
+    if direction == "UP":
+        buy_k = atm_strike - hedge_pts
+        sell_k = atm_strike
+        legs = [
+            {"action": "BUY", "strike": buy_k, "side": "PE", "entry_ltp": _get_ltp(buy_k, "PE")},
+            {"action": "SELL", "strike": sell_k, "side": "PE", "entry_ltp": _get_ltp(sell_k, "PE")},
+        ]
+        strat_name = "Bull Put Spread (तेज़ी का ट्रेड)"
+        summary = f"Sell {sell_k} PE / Buy {buy_k} PE"
+    elif direction == "DOWN":
+        buy_k = atm_strike + hedge_pts
+        sell_k = atm_strike
+        legs = [
+            {"action": "BUY", "strike": buy_k, "side": "CE", "entry_ltp": _get_ltp(buy_k, "CE")},
+            {"action": "SELL", "strike": sell_k, "side": "CE", "entry_ltp": _get_ltp(sell_k, "CE")},
+        ]
+        strat_name = "Bear Call Spread (मंदी का ट्रेड)"
+        summary = f"Sell {sell_k} CE / Buy {buy_k} CE"
+    else:
+        buy_ce = atm_strike + hedge_pts
+        buy_pe = atm_strike - hedge_pts
+        legs = [
+            {"action": "BUY", "strike": buy_ce, "side": "CE", "entry_ltp": _get_ltp(buy_ce, "CE")},
+            {"action": "BUY", "strike": buy_pe, "side": "PE", "entry_ltp": _get_ltp(buy_pe, "PE")},
+            {"action": "SELL", "strike": atm_strike, "side": "CE", "entry_ltp": _get_ltp(atm_strike, "CE")},
+            {"action": "SELL", "strike": atm_strike, "side": "PE", "entry_ltp": _get_ltp(atm_strike, "PE")},
+        ]
+        strat_name = "Straddle with Hedge / Iron Fly (साइडवेज़ ट्रेड)"
+        summary = f"Straddle {atm_strike} CE+PE Sell / Hedge {buy_ce} CE & {buy_pe} PE Buy"
+
+    net_credit_pts = sum(
+        lg["entry_ltp"] if lg["action"] == "SELL" else -lg["entry_ltp"]
+        for lg in legs
+    )
+    return strat_name, summary, legs, round(net_credit_pts, 2)
+
+
+def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots, lot_qty, contract_map, trigger_src="Manual"):
     ist = pytz.timezone('Asia/Kolkata')
     now_str = datetime.now(ist).strftime("%I:%M:%S %p")
     total_qty = lots * lot_qty
     exch = "BFO" if selected_idx == "Sensex" else "NFO"
 
-    sell_c = contract_map.get((sell_strike, side), {"symbol": f"{selected_idx}_{sell_strike}_{side}", "token": "0", "exch": exch})
-    buy_c = contract_map.get((buy_strike, side), {"symbol": f"{selected_idx}_{buy_strike}_{side}", "token": "0", "exch": exch})
+    enriched_legs = []
+    for lg in legs:
+        c_info = contract_map.get(
+            (lg["strike"], lg["side"]),
+            {"symbol": f"{selected_idx}_{lg['strike']}_{lg['side']}", "token": "0", "exch": exch}
+        )
+        enriched_legs.append({
+            "action": lg["action"],
+            "strike": lg["strike"],
+            "side": lg["side"],
+            "entry_ltp": lg["entry_ltp"],
+            "symbol": c_info["symbol"],
+            "token": c_info["token"],
+            "exch": c_info["exch"]
+        })
+
+    # BUY लेग्स पहले और SELL लेग्स बाद में (मार्जिन सुरक्षा के लिए)
+    ordered_legs = [x for x in enriched_legs if x["action"] == "BUY"] + [x for x in enriched_legs if x["action"] == "SELL"]
 
     if mode == "🔴 LIVE ALGO (असली पैसा)":
         if "angel_jwt" not in st.session_state:
@@ -546,35 +619,29 @@ def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell
         jwt = st.session_state["angel_jwt"]
         akey = st.session_state["angel_key"]
 
-        ok_buy, msg_buy = place_angel_order(jwt, akey, buy_c["exch"], buy_c["symbol"], buy_c["token"], "BUY", total_qty)
-        if not ok_buy:
-            send_telegram_alert(f"⚠️ <b>ORDER REJECTED ({selected_idx})</b>\nHedge Buy विफल: {msg_buy}")
-            return False, f"Hedge Buy ऑर्डर विफल: {msg_buy}"
+        executed_so_far = []
+        for lg in ordered_legs:
+            ok_ord, msg_ord = place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], lg["action"], total_qty)
+            if not ok_ord:
+                for prev in reversed(executed_so_far):
+                    rev_act = "SELL" if prev["action"] == "BUY" else "BUY"
+                    place_angel_order(jwt, akey, prev["exch"], prev["symbol"], prev["token"], rev_act, total_qty)
+                send_telegram_alert(f"⚠️ <b>ORDER REJECTED ({selected_idx})</b>\n{lg['action']} {lg['strike']} {lg['side']} विफल: {msg_ord}")
+                return False, f"{lg['action']} {lg['strike']} {lg['side']} विफल (बाकी ऑर्डर सुरक्षित काट दिए गए): {msg_ord}"
+            executed_so_far.append(lg)
+            time.sleep(0.35)
 
-        time.sleep(0.4)
-
-        ok_sell, msg_sell = place_angel_order(jwt, akey, sell_c["exch"], sell_c["symbol"], sell_c["token"], "SELL", total_qty)
-        if not ok_sell:
-            place_angel_order(jwt, akey, buy_c["exch"], buy_c["symbol"], buy_c["token"], "SELL", total_qty)
-            send_telegram_alert(f"⚠️ <b>ATM SELL REJECTED ({selected_idx})</b>\nHedge सुरक्षित काट दिया गया: {msg_sell}")
-            return False, f"ATM Sell रिजेक्ट हुआ (Hedge भी सुरक्षित काट दिया गया): {msg_sell}"
-
-    sl_limit = 2000.0 * lots
+    # नया स्टॉप-लॉस: ₹1,700 प्रति लॉट
+    sl_limit = 1700.0 * lots
     new_trade = {
         "mode": mode,
         "index": selected_idx,
-        "side": side,
+        "strategy": strat_name,
+        "summary": summary,
         "lots": lots,
         "qty": total_qty,
         "exch": exch,
-        "sell_strike": sell_strike,
-        "buy_strike": buy_strike,
-        "sell_symbol": sell_c["symbol"],
-        "buy_symbol": buy_c["symbol"],
-        "sell_token": sell_c["token"],
-        "buy_token": buy_c["token"],
-        "sell_entry": sell_ltp,
-        "buy_entry": buy_ltp,
+        "legs": ordered_legs,
         "entry_time": now_str,
         "sl_rs": sl_limit
     }
@@ -582,21 +649,22 @@ def execute_spread_entry(mode, selected_idx, side, sell_strike, buy_strike, sell
     save_active_trade(new_trade)
 
     mode_tag = "🟡 PAPER TRADE" if "PAPER" in mode else "🔴 LIVE ALGO TRADE"
-    spread_type = "Bull Put Spread" if side == "PE" else "Bear Call Spread"
+    legs_lines = "\n".join([f"• <b>{l['action']}</b> {l['strike']} {l['side']} @ ₹{l['entry_ltp']}" for l in ordered_legs])
     tg_msg = (
         f"🚀 <b>{mode_tag} EXECUTED ({trigger_src})</b>\n"
-        f"📊 <b>Index:</b> {selected_idx} ({spread_type})\n"
-        f"🛡️ <b>1. Hedge Buy:</b> {buy_strike} {side} @ ₹{buy_ltp}\n"
-        f"💰 <b>2. ATM Sell:</b> {sell_strike} {side} @ ₹{sell_ltp}\n"
+        f"📊 <b>Index:</b> {selected_idx}\n"
+        f"🧭 <b>Strategy:</b> {strat_name}\n"
+        f"{legs_lines}\n"
         f"📦 <b>Qty:</b> {lots} Lot ({total_qty} Qty)\n"
         f"🛑 <b>Auto Stop-Loss:</b> -₹{int(sl_limit):,}\n"
         f"⏰ <b>Time:</b> {now_str}\n\n"
         f"💡 <i>पोजीशन बंद करने के लिए <b>/exit</b> और लाइव प्रॉफिट देखने के लिए <b>/status</b> भेजें।</i>"
     )
     send_telegram_alert(tg_msg)
-    return True, f"सफल! पहले {buy_strike} {side} Buy और फिर {sell_strike} {side} Sell एग्जीक्यूट हुआ।"
+    return True, f"सफल! {strat_name} ({summary}) एग्जीक्यूट हो गया।"
 
-def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
+
+def close_active_trade(curr_ltp_by_idx, reason="Manual Exit"):
     tr = st.session_state["active_trade"]
     if not tr:
         return
@@ -605,15 +673,45 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
     today_str = datetime.now(ist).strftime("%Y-%m-%d")
     exit_time = datetime.now(ist).strftime("%I:%M:%S %p")
 
-    if tr["mode"] == "🔴 LIVE ALGO (असली पैसा)" and "angel_jwt" in st.session_state:
-        jwt = st.session_state["angel_jwt"]
-        akey = st.session_state["angel_key"]
-        place_angel_order(jwt, akey, tr["exch"], tr["sell_symbol"], tr["sell_token"], "BUY", tr["qty"])
-        time.sleep(0.4)
-        place_angel_order(jwt, akey, tr["exch"], tr["buy_symbol"], tr["buy_token"], "SELL", tr["qty"])
+    if "legs" in tr and tr["legs"]:
+        legs = tr["legs"]
+        sell_legs_idx = [i for i, l in enumerate(legs) if l["action"] == "SELL"]
+        buy_legs_idx = [i for i, l in enumerate(legs) if l["action"] == "BUY"]
 
-    pnl_pts = (tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - tr["buy_entry"])
-    pnl_rs = round(pnl_pts * tr["qty"], 2)
+        if tr["mode"] == "🔴 LIVE ALGO (असली पैसा)" and "angel_jwt" in st.session_state:
+            jwt = st.session_state["angel_jwt"]
+            akey = st.session_state["angel_key"]
+            for i in sell_legs_idx:
+                lg = legs[i]
+                place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], "BUY", tr["qty"])
+                time.sleep(0.35)
+            for i in buy_legs_idx:
+                lg = legs[i]
+                place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], "SELL", tr["qty"])
+                time.sleep(0.35)
+
+        pnl_pts = 0.0
+        for i, lg in enumerate(legs):
+            now_px = curr_ltp_by_idx.get(i, lg["entry_ltp"])
+            if lg["action"] == "SELL":
+                pnl_pts += (lg["entry_ltp"] - now_px)
+            else:
+                pnl_pts += (now_px - lg["entry_ltp"])
+
+        pnl_rs = round(pnl_pts * tr["qty"], 2)
+        spread_label = tr.get("summary", tr.get("strategy", "Spread"))
+    else:
+        curr_s = curr_ltp_by_idx.get("sell", tr["sell_entry"])
+        curr_b = curr_ltp_by_idx.get("buy", tr["buy_entry"])
+        if tr["mode"] == "🔴 LIVE ALGO (असली पैसा)" and "angel_jwt" in st.session_state:
+            jwt = st.session_state["angel_jwt"]
+            akey = st.session_state["angel_key"]
+            place_angel_order(jwt, akey, tr["exch"], tr["sell_symbol"], tr["sell_token"], "BUY", tr["qty"])
+            time.sleep(0.4)
+            place_angel_order(jwt, akey, tr["exch"], tr["buy_symbol"], tr["buy_token"], "SELL", tr["qty"])
+        pnl_pts = (tr["sell_entry"] - curr_s) + (curr_b - tr["buy_entry"])
+        pnl_rs = round(pnl_pts * tr["qty"], 2)
+        spread_label = f"Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}"
 
     if tr["mode"] == "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)":
         st.session_state["paper_capital"] += pnl_rs
@@ -623,7 +721,7 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
         "तारीख": today_str,
         "मोड": mode_short,
         "इंडेक्स": tr["index"],
-        "स्प्रेड": f"Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}",
+        "स्प्रेड": spread_label,
         "लॉट": tr["lots"],
         "एंट्री समय": tr["entry_time"],
         "एग्जिट समय": exit_time,
@@ -637,13 +735,14 @@ def close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Exit"):
     tg_exit_msg = (
         f"{icon} <b>TRADE CLOSED ({mode_short})</b>\n"
         f"📊 <b>Index:</b> {tr['index']}\n"
-        f"📌 <b>Spread:</b> Sell {tr['sell_strike']} {tr['side']} / Buy {tr['buy_strike']} {tr['side']}\n"
+        f"📌 <b>Strategy:</b> {spread_label}\n"
         f"📝 <b>Reason:</b> {reason}\n"
         f"💵 <b>Final P&L:</b> <b>₹{pnl_rs:+,.0f}</b>\n"
         f"⏰ <b>Exit Time:</b> {exit_time}"
     )
     send_telegram_alert(tg_exit_msg)
     st.session_state["active_trade"] = None
+
 
 def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
     headers = {
@@ -718,7 +817,7 @@ def bs_option_price(spot, strike, t_years, iv, opt_type="CE"):
     return max(0.5, px)
 
 def calc_roundtrip_charges(sell_entry, sell_exit, buy_entry, buy_exit, qty):
-    """Angel One असली ब्रोकरेज + STT + NSE + Stamp Duty + GST (4 ऑर्डर राउंड ट्रिप)"""
+    """Angel One असली ब्रोकरेज + STT + NSE + Stamp Duty + GST"""
     sell_turnover = (sell_entry + buy_exit) * qty
     buy_turnover = (buy_entry + sell_exit) * qty
     total_turnover = sell_turnover + buy_turnover
@@ -741,10 +840,10 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE
+# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (Direction-Aware)
 # ==========================================
 with tab1:
-    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (⚡ Smooth Live)")
+    st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (दिशा सिग्नल आधारित)")
 
     has_tg = ("TELEGRAM_BOT_TOKEN" in st.secrets and "TELEGRAM_CHAT_ID" in st.secrets)
     t_col1, t_col2 = st.columns([3, 1])
@@ -780,9 +879,9 @@ with tab1:
 
     c_auto1, c_auto2 = st.columns(2)
     with c_auto1:
-        auto_10am = st.toggle("⏰ सुबह 10:00 AM पर ऑटो-एंट्री चालू रखें (ऊपर 3 vs नीचे 3 Chg OI)", value=False)
+        auto_10am = st.toggle("⏰ सुबह 10:00 AM पर ऑटो-एंट्री चालू रखें (ऊपर = Bull Put | नीचे = Bear Call | साइडवेज़ = Straddle + Hedge)", value=False)
     with c_auto2:
-        st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` ({st.session_state['gh_sync_status']}) | 🛑 **Auto SL:** `₹{2000 * algo_lots:,.0f}`")
+        st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` ({st.session_state['gh_sync_status']}) | 🛑 **Auto SL:** `₹{1700 * algo_lots:,.0f}` (`₹1,700/Lot`)")
 
     @st.fragment(run_every=10)
     def render_algo_dashboard(mode_sel, selected_idx, lots_cnt, is_unlocked, is_auto_10):
@@ -793,12 +892,13 @@ with tab1:
 
         tg_cmd = check_telegram_commands()
 
+        # नए हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
         if selected_idx == "Nifty 50":
-            sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 300, 75
+            sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 500, 75
         elif selected_idx == "Bank Nifty":
-            sym, step, default_spot, hedge_pts, lot_qty = "^NSEBANK", 100, 51000.0, 300, 30
+            sym, step, default_spot, hedge_pts, lot_qty = "^NSEBANK", 100, 51000.0, 1000, 30
         else:
-            sym, step, default_spot, hedge_pts, lot_qty = "^BSESN", 100, 79000.0, 1000, 20
+            sym, step, default_spot, hedge_pts, lot_qty = "^BSESN", 100, 79000.0, 1500, 20
 
         is_live_api = False
         full_df = None
@@ -824,7 +924,7 @@ with tab1:
             spot_price = float(spot_data['Close'].iloc[-1]) if not spot_data.empty else default_spot
             atm_t = round(spot_price / step) * step
             np.random.seed(int(now_ist.strftime("%H%M%S")) + int(atm_t))
-            strikes_t = [atm_t + (i * step) for i in range(-12, 13)]
+            strikes_t = [atm_t + (i * step) for i in range(-18, 19)]
             full_df = pd.DataFrame({
                 "STRIKE": strikes_t,
                 "CALL CHG OI": [int(np.random.randint(-5, 30) * 1000) for _ in strikes_t],
@@ -833,100 +933,104 @@ with tab1:
                 "PUT LTP": [max(5.0, round(max(0, s - spot_price) + 75, 1)) for s in strikes_t]
             })
 
-        # --- साफ़ हिंदी में बाज़ार की दिशा बैनर (ऊपर / नीचे / साइडवेज) ---
-        g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label)
-        st.markdown(f"""
-        <div style="background: {g_info['bg_color']}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin-bottom: 14px;">
-            <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
-            <div style="font-size: 22px; font-weight: bold; margin-bottom: 4px;">{g_info['headline']}</div>
-            <div style="font-size: 13px; color: #e2e8f0; margin-bottom: 6px;">{g_info['sub_headline']}</div>
-            <div style="font-size: 14px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
         atm_strike = round(spot_price / step) * step
+
+        # Greeks + OI दिशा सिग्नल प्राप्त करना (UP / DOWN / SIDEWAYS)
+        g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label)
+        market_dir = g_info.get("direction", "SIDEWAYS")
+        if market_dir not in ["UP", "DOWN", "SIDEWAYS"]:
+            market_dir = "SIDEWAYS"
+
+        strat_name, strat_summary, plan_legs, net_credit_pts = build_strategy_plan(
+            market_dir, selected_idx, atm_strike, hedge_pts, full_df
+        )
+        est_credit_rs = round(net_credit_pts * lot_qty * lots_cnt, 0)
 
         up_3_df = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3*step)]
         down_3_df = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3*step)]
-
         up_3_call_chg = int(up_3_df["CALL CHG OI"].sum()) if not up_3_df.empty else 0
         down_3_put_chg = int(down_3_df["PUT CHG OI"].sum()) if not down_3_df.empty else 0
-
-        if down_3_put_chg >= up_3_call_chg:
-            rec_side = "PE"
-            rec_sell_strike = atm_strike
-            rec_buy_strike = atm_strike - hedge_pts
-            rec_title = f"🟢 एल्गो सिग्नल: Bull Put Spread (Sell {rec_sell_strike} PE + Buy {rec_buy_strike} PE)"
-        else:
-            rec_side = "CE"
-            rec_sell_strike = atm_strike
-            rec_buy_strike = atm_strike + hedge_pts
-            rec_title = f"🔴 एल्गो सिग्नल: Bear Call Spread (Sell {rec_sell_strike} CE + Buy {rec_buy_strike} CE)"
-
-        sell_row = full_df[full_df["STRIKE"] == rec_sell_strike]
-        buy_row = full_df[full_df["STRIKE"] == rec_buy_strike]
-        ltp_col = "PUT LTP" if rec_side == "PE" else "CALL LTP"
-
-        rec_sell_ltp = float(sell_row[ltp_col].values[0]) if not sell_row.empty else 120.0
-        rec_buy_ltp = float(buy_row[ltp_col].values[0]) if not buy_row.empty else 45.0
-        est_credit_rs = round((rec_sell_ltp - rec_buy_ltp) * lot_qty * lots_cnt, 0)
 
         active_tr = st.session_state["active_trade"]
         if active_tr is not None:
             st.markdown("### 🔥 चालू पोजीशन (Live MTM & Telegram Remote Control)")
-            curr_sell_ltp = active_tr["sell_entry"]
-            curr_buy_ltp = active_tr["buy_entry"]
 
-            if is_live_api and "angel_jwt" in st.session_state and active_tr["sell_token"] != "0":
-                ltp_map = get_live_ltp_for_tokens(
-                    st.session_state["angel_jwt"], st.session_state["angel_key"],
-                    active_tr["exch"], (active_tr["sell_token"], active_tr["buy_token"])
-                )
-                curr_sell_ltp = ltp_map.get(active_tr["sell_token"], curr_sell_ltp)
-                curr_buy_ltp = ltp_map.get(active_tr["buy_token"], curr_buy_ltp)
-            else:
-                curr_sell_ltp = max(1.0, round(active_tr["sell_entry"] + np.random.uniform(-4, 4), 1))
-                curr_buy_ltp = max(1.0, round(active_tr["buy_entry"] + np.random.uniform(-2, 2), 1))
+            if "legs" in active_tr and active_tr["legs"]:
+                legs = active_tr["legs"]
+                tokens_tup = tuple(l["token"] for l in legs if l.get("token") and l["token"] != "0")
+                ltp_map = {}
+                if is_live_api and "angel_jwt" in st.session_state and tokens_tup:
+                    ltp_map = get_live_ltp_for_tokens(
+                        st.session_state["angel_jwt"], st.session_state["angel_key"],
+                        active_tr["exch"], tokens_tup
+                    )
 
-            live_pnl_pts = (active_tr["sell_entry"] - curr_sell_ltp) + (curr_buy_ltp - active_tr["buy_entry"])
-            live_pnl_rs = round(live_pnl_pts * active_tr["qty"], 2)
+                curr_ltp_by_idx = {}
+                live_pnl_pts = 0.0
+                for i, lg in enumerate(legs):
+                    if lg["token"] in ltp_map:
+                        c_px = ltp_map[lg["token"]]
+                    else:
+                        c_px = max(0.5, round(lg["entry_ltp"] + np.random.uniform(-3, 3), 1))
+                    curr_ltp_by_idx[i] = c_px
+                    if lg["action"] == "SELL":
+                        live_pnl_pts += (lg["entry_ltp"] - c_px)
+                    else:
+                        live_pnl_pts += (c_px - lg["entry_ltp"])
 
-            if tg_cmd == "STATUS":
-                send_telegram_alert(
-                    f"📊 <b>LIVE POSITION STATUS</b>\n"
-                    f"📌 <b>Spread:</b> Sell {active_tr['sell_strike']} {active_tr['side']} / Buy {active_tr['buy_strike']} {active_tr['side']}\n"
-                    f"💵 <b>Current MTM:</b> <b>₹{live_pnl_rs:+,.0f}</b>\n"
-                    f"🛑 <b>Auto SL:</b> -₹{int(active_tr['sl_rs']):,}"
-                )
+                live_pnl_rs = round(live_pnl_pts * active_tr["qty"], 2)
+                strat_title_active = active_tr.get("strategy", "Active Spread")
 
-            if tg_cmd == "EXIT":
-                close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Telegram /exit Command 📲")
-                st.warning("📲 Telegram से `/exit` कमांड मिला! पोजीशन बंद कर दी गई है।")
-                st.rerun()
-            elif live_pnl_rs <= -active_tr["sl_rs"]:
-                close_active_trade(curr_sell_ltp, curr_buy_ltp, reason=f"Auto SL Hit (-₹{int(active_tr['sl_rs'])})")
-                st.error("🛑 Stop-Loss हिट हुआ! पोजीशन बंद करके Telegram पर अलर्ट भेज दिया गया है।")
-                st.rerun()
-            elif now_ist.hour == 15 and now_ist.minute >= 15:
-                close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="3:15 PM Auto Square-Off")
-                st.info("⏰ 3:15 PM हो गए! पोजीशन बंद करके Telegram पर रिपोर्ट भेज दी गई है।")
-                st.rerun()
+                if tg_cmd == "STATUS":
+                    leg_status_txt = "\n".join([
+                        f"• {l['action']} {l['strike']} {l['side']}: Entry ₹{l['entry_ltp']} ➔ Now ₹{curr_ltp_by_idx[i]}"
+                        for i, l in enumerate(legs)
+                    ])
+                    send_telegram_alert(
+                        f"📊 <b>LIVE POSITION STATUS</b>\n"
+                        f"🧭 <b>Strategy:</b> {strat_title_active}\n"
+                        f"{leg_status_txt}\n"
+                        f"💵 <b>Current MTM:</b> <b>₹{live_pnl_rs:+,.0f}</b>\n"
+                        f"🛑 <b>Auto SL:</b> -₹{int(active_tr['sl_rs']):,}"
+                    )
 
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("मोड & इंडेक्स", f"{active_tr['index']}", active_tr["mode"].split(" ")[1])
-            p2.metric("बेची गई ATM स्ट्राइक", f"{active_tr['sell_strike']} {active_tr['side']}", f"Entry: ₹{active_tr['sell_entry']} | Now: ₹{curr_sell_ltp}")
-            p3.metric("खरीदी गई Hedge स्ट्राइक", f"{active_tr['buy_strike']} {active_tr['side']}", f"Entry: ₹{active_tr['buy_entry']} | Now: ₹{curr_buy_ltp}")
-            p4.metric("लाइव MTM लाभ / हानि", f"₹{live_pnl_rs:+,.0f}", f"Auto SL: -₹{int(active_tr['sl_rs']):,}")
-
-            b_exit1, b_exit2 = st.columns([3, 1])
-            with b_exit1:
-                if st.button("🚨 पोजीशन अभी बंद करें (Square-Off Now)", type="primary", use_container_width=True):
-                    close_active_trade(curr_sell_ltp, curr_buy_ltp, reason="Manual Square-Off")
-                    st.success("✅ पोजीशन बंद कर दी गई है और Telegram अलर्ट भेज दिया गया है।")
+                if tg_cmd == "EXIT":
+                    close_active_trade(curr_ltp_by_idx, reason="Telegram /exit Command 📲")
+                    st.warning("📲 Telegram से `/exit` कमांड मिला! पोजीशन बंद कर दी गई है।")
                     st.rerun()
-            with b_exit2:
-                if st.button("🔄 Check Telegram /exit", use_container_width=True):
+                elif live_pnl_rs <= -active_tr["sl_rs"]:
+                    close_active_trade(curr_ltp_by_idx, reason=f"Auto SL Hit (-₹{int(active_tr['sl_rs'])})")
+                    st.error("🛑 Stop-Loss हिट हुआ! पोजीशन बंद करके Telegram पर अलर्ट भेज दिया गया है।")
                     st.rerun()
+                elif now_ist.hour == 15 and now_ist.minute >= 15:
+                    close_active_trade(curr_ltp_by_idx, reason="3:15 PM Auto Square-Off")
+                    st.info("⏰ 3:15 PM हो गए! पोजीशन बंद करके Telegram पर रिपोर्ट भेज दी गई है।")
+                    st.rerun()
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("मोड & इंडेक्स", f"{active_tr['index']} ({active_tr['mode'].split(' ')[1]})", strat_title_active)
+                m2.metric("कुल लेग्स (Legs)", f"{len(legs)} ऑर्डर सक्रिय", f"Qty: {active_tr['qty']}")
+                m3.metric("लाइव MTM लाभ / हानि", f"₹{live_pnl_rs:+,.0f}", f"Auto SL: -₹{int(active_tr['sl_rs']):,}")
+
+                leg_cols = st.columns(len(legs))
+                for i, lg in enumerate(legs):
+                    c_px = curr_ltp_by_idx[i]
+                    leg_pnl = round(((lg["entry_ltp"] - c_px) if lg["action"] == "SELL" else (c_px - lg["entry_ltp"])) * active_tr["qty"], 0)
+                    leg_cols[i].metric(
+                        f"{lg['action']} {lg['strike']} {lg['side']}",
+                        f"₹{c_px}",
+                        f"Entry: ₹{lg['entry_ltp']} | P&L: ₹{leg_pnl:+,.0f}"
+                    )
+
+                b_exit1, b_exit2 = st.columns([3, 1])
+                with b_exit1:
+                    if st.button("🚨 सभी लेग्स अभी बंद करें (Square-Off All)", type="primary", use_container_width=True):
+                        close_active_trade(curr_ltp_by_idx, reason="Manual Square-Off")
+                        st.success("✅ पूरी पोजीशन बंद कर दी गई है और Telegram अलर्ट भेज दिया गया है।")
+                        st.rerun()
+                with b_exit2:
+                    if st.button("🔄 Check Telegram /exit", use_container_width=True):
+                        st.rerun()
 
         else:
             if tg_cmd == "STATUS":
@@ -934,32 +1038,38 @@ with tab1:
             elif tg_cmd == "EXIT":
                 send_telegram_alert("ℹ️ <b>EXIT:</b> बंद करने के लिए कोई चालू पोजीशन नहीं है।")
 
+            legs_html = " &nbsp;|&nbsp; ".join([
+                f"<b>{l['action']} {l['strike']} {l['side']}</b> (@ ₹{l['entry_ltp']})"
+                for l in plan_legs
+            ])
+
             st.markdown(f"""
-            <div style="background: linear-gradient(90deg, #1e293b, #0f172a); padding: 16px; border-radius: 12px; border: 1px solid #334155; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #94a3b8;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b></div>
-                <h4 style="margin: 6px 0; color: #38bdf8;">{rec_title}</h4>
-                <div style="font-size: 14px;">1️⃣ पहले Hedge Buy: <b>{rec_buy_strike} {rec_side}</b> (@ ₹{rec_buy_ltp}) &nbsp;➔&nbsp; 2️⃣ फिर ATM Sell: <b>{rec_sell_strike} {rec_side}</b> (@ ₹{rec_sell_ltp}) &nbsp;|&nbsp; अनुमानित क्रेडिट: <b>₹{est_credit_rs:,.0f}</b></div>
+            <div style="background: {g_info.get('bg_color', 'linear-gradient(90deg, #1e293b, #0f172a)')}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info.get('border_color', '#38bdf8')}; color: white; margin-bottom: 12px;">
+                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b> | 🛡️ हेज दूरी: <b>{hedge_pts} pts</b></div>
+                <div style="font-size: 21px; font-weight: bold; margin: 6px 0;">{g_info.get('headline', '🟡 बाज़ार विश्लेषण')}</div>
+                <div style="font-size: 16px; font-weight: bold; color: #fde047; margin-bottom: 6px;">🎯 एल्गो ऑटो-रणनीति: {strat_name}</div>
+                <div style="font-size: 14px; color: #f8fafc;">{legs_html} &nbsp;➔&nbsp; अनुमानित नेट क्रेडिट: <b>₹{est_credit_rs:,.0f}</b> &nbsp;|&nbsp; 🛑 SL: <b>₹{1700 * lots_cnt:,.0f}</b></div>
             </div>
             """, unsafe_allow_html=True)
 
             if is_auto_10 and now_ist.hour == 10 and now_ist.minute <= 2 and st.session_state["auto_traded_date"] != today_str:
                 if "PAPER" in mode_sel or is_unlocked:
-                    ok, msg = execute_spread_entry(
-                        mode_sel, selected_idx, rec_side, rec_sell_strike, rec_buy_strike,
-                        rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map, trigger_src="10:00 AM Auto"
+                    ok, msg = execute_multi_leg_entry(
+                        mode_sel, selected_idx, strat_name, strat_summary, plan_legs,
+                        lots_cnt, lot_qty, contract_map, trigger_src="10:00 AM Auto"
                     )
                     if ok:
                         st.session_state["auto_traded_date"] = today_str
                         st.success(f"⏰ 10:00 AM Auto-Trade: {msg}")
                         st.rerun()
 
-            btn_label = f"🟡 1-Click PAPER TRADE लगाएं ({lots_cnt} Lot)" if "PAPER" in mode_sel else f"🔴 1-Click LIVE ORDER लगाएं ({lots_cnt} Lot)"
+            btn_label = f"🟡 1-Click PAPER TRADE लगाएं — {strat_name} ({lots_cnt} Lot)" if "PAPER" in mode_sel else f"🔴 1-Click LIVE ORDER लगाएं — {strat_name} ({lots_cnt} Lot)"
             btn_disabled = ("LIVE ALGO" in mode_sel and not is_unlocked)
 
             if st.button(btn_label, disabled=btn_disabled, use_container_width=True):
-                ok, msg = execute_spread_entry(
-                    mode_sel, selected_idx, rec_side, rec_sell_strike, rec_buy_strike,
-                    rec_sell_ltp, rec_buy_ltp, lots_cnt, lot_qty, contract_map, trigger_src="1-Click"
+                ok, msg = execute_multi_leg_entry(
+                    mode_sel, selected_idx, strat_name, strat_summary, plan_legs,
+                    lots_cnt, lot_qty, contract_map, trigger_src="1-Click"
                 )
                 if ok:
                     st.success(f"✅ {msg}")
@@ -983,7 +1093,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV + Greeks दिशा बैनर
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV इंडिकेटर
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -1028,11 +1138,11 @@ with tab2:
         now_str = datetime.now(ist).strftime("%I:%M:%S %p")
 
         if selected_idx == "Nifty 50":
-            sym, step, default_spot, hedge_pts = "^NSEI", 50, 24000.0, 300
+            sym, step, default_spot, hedge_pts = "^NSEI", 50, 24000.0, 500
         elif selected_idx == "Bank Nifty":
-            sym, step, default_spot, hedge_pts = "^NSEBANK", 100, 51000.0, 300
+            sym, step, default_spot, hedge_pts = "^NSEBANK", 100, 51000.0, 1000
         else:
-            sym, step, default_spot, hedge_pts = "^BSESN", 100, 79000.0, 1000
+            sym, step, default_spot, hedge_pts = "^BSESN", 100, 79000.0, 1500
 
         is_live = False
         expiry_label = "Simulation"
@@ -1087,7 +1197,7 @@ with tab2:
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
         st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
-        # --- नया OTM 3-Strike IV इंडिकेटर ---
+        # --- नया OTM 3-Strike IV इंडिकेटर (pages/otm_iv_indicator.py से) ---
         iv_info = evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label)
 
         iv_c1, iv_c2, iv_c3 = st.columns(3)
@@ -1101,23 +1211,6 @@ with tab2:
             st.error(f"🚨 **{iv_info['spread_name']}** — {iv_info['message']}")
         else:
             st.info(f"⏳ **{iv_info['spread_name']}** — {iv_info['message']}")
-
-        # --- साफ़ हिंदी में बाज़ार की दिशा बैनर (ऊपर / नीचे / साइडवेज) ---
-        g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label)
-        st.markdown(f"""
-        <div style="background: {g_info['bg_color']}; padding: 18px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin: 12px 0;">
-            <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
-            <div style="font-size: 24px; font-weight: bold; margin-bottom: 6px;">{g_info['headline']}</div>
-            <div style="font-size: 14px; color: #e2e8f0; margin-bottom: 8px;">{g_info['sub_headline']}</div>
-            <div style="font-size: 15px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        g1, g2, g3, g4 = st.columns(4)
-        g1.metric("Theta/Delta क्षमता", f"{g_info['efficiency_score']}", "3.5 से ऊपर = शांत बाज़ार")
-        g2.metric("ATM रोज़ाना Theta", f"₹{g_info['atm_theta']}/दिन", "प्रीमियम गलन की रफ़्तार")
-        g3.metric("Gamma-IV दबाव", f"{g_info['gamma_iv_risk']} / 100", f"ATM IV: {g_info['atm_iv']}%")
-        g4.metric("नेट ATM Delta", f"{g_info['net_delta']:+}", "+ ऊपर | - नीचे | 0 साइडवेज")
 
         def style_seller_chain(row):
             styles = [''] * len(row)
@@ -1194,16 +1287,16 @@ with tab3:
     with b4:
         deduct_costs = st.checkbox("ब्रोकरेज + टैक्स + स्लिपेज घटाएं", value=True)
 
-    sl_per_lot = 2000.0
+    sl_per_lot = 1700.0
     total_sl_rs = sl_per_lot * lots
 
     if st.button("🚀 सटीक बैकटेस्ट चलाएं (Run Accurate Backtest)", use_container_width=True):
         if bt_idx == "Nifty 50":
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 300, 3, 0.135
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 500, 3, 0.135
         elif bt_idx == "Bank Nifty":
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 300, 2, 0.165
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 1000, 2, 0.165
         else:
-            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1000, 4, 0.145
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1500, 4, 0.145
 
         total_qty = lot_qty * lots
         trade_col_name = f"ट्रेड (ATM + {hedge_points} Hedge)"
