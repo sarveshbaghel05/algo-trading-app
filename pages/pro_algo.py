@@ -658,19 +658,21 @@ with pro_tab1:
     run_pro_terminal()
 
 # ==========================================
-# TAB 2: PRO BACKTEST (0.25 Delta OTM + ORB + Leg-wise SL + Profit Lock)
+# TAB 2: PRO BACKTEST (0.25 Delta OTM + ORB + Leg-wise SL + Exact Angel One Costs)
 # ==========================================
 with pro_tab2:
     st.subheader("📊 Smart 4-Layer Pro सिस्टम बैकटेस्ट (1-Min Angel One डेटा)")
-    st.caption("इसमें 0.25 Delta OTM स्ट्राइक, सुबह की 1% रेंज नो-ट्रेड फ़िल्टर, Leg-wise 35% SL (Straddle में) और 65% प्रॉफिट टारगेट शामिल है।")
+    st.caption("इसमें 0.25 Delta OTM स्ट्राइक, सुबह की 1% रेंज नो-ट्रेड फ़िल्टर, Leg-wise 35% SL और सटीक Angel One ब्रोकरेज + टैक्स + स्लिपेज शामिल है।")
 
-    b1, b2, b3 = st.columns(3)
+    b1, b2, b3, b4 = st.columns(4)
     with b1:
         pbt_idx = st.selectbox("इंडेक्स:", ["Nifty 50", "Sensex", "Bank Nifty"], key="pbt_idx")
     with b2:
         pbt_days = st.selectbox("अवधि:", ["30 दिन (1 महीना)", "90 दिन (3 महीने)", "365 दिन (1 साल)"], index=2, key="pbt_days")
     with b3:
         pbt_lots = st.number_input("लॉट:", 1, 25, 1, key="pbt_lots")
+    with b4:
+        pbt_deduct_costs = st.checkbox("ब्रोकरेज + टैक्स + स्लिपेज घटाएं", value=True, key="pbt_costs")
 
     def _bs_px(S, K, T, iv, side):
         if T <= 1e-6:
@@ -682,6 +684,17 @@ with pro_tab2:
         nd2 = 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
         px = (S * nd1 - K * math.exp(-r * T) * nd2) if side == "CE" else (K * math.exp(-r * T) * (1.0 - nd2) - S * (1.0 - nd1))
         return max(0.5, px)
+
+    def _calc_pro_angel_charges(sell_turnover, buy_turnover, order_count):
+        """Angel One सटीक ब्रोकरेज (₹20/ऑर्डर) + STT + NSE/BSE + Stamp Duty + GST"""
+        total_turnover = sell_turnover + buy_turnover
+        brokerage = 20.0 * order_count
+        stt = sell_turnover * 0.0015
+        exch = total_turnover * 0.0003553
+        sebi = total_turnover * 0.000001
+        stamp = buy_turnover * 0.00003
+        gst = (brokerage + exch + sebi) * 0.18
+        return round(brokerage + stt + exch + sebi + stamp + gst, 2)
 
     if st.button("🚀 Pro बैकटेस्ट चलाएं", use_container_width=True):
         cfg = {
@@ -728,8 +741,10 @@ with pro_tab2:
 
             logs = []
             skipped_days = 0
+            total_costs_paid = 0.0
             total_qty = cfg["lot"] * pbt_lots
             step, hedge = cfg["step"], cfg["hedge"]
+            slip_mult = 1.0 if pbt_deduct_costs else 0.0
 
             for dt, day_df in df.groupby("Date"):
                 morn = day_df.between_time("09:15", "09:59")
@@ -747,7 +762,6 @@ with pro_tab2:
                 rng_pct = ((h959 - l959) / s1000) * 100.0
                 pos_rng = (s1000 - l959) / max(1.0, h959 - l959)
 
-                # नो-ट्रेड फ़िल्टर (1% से बड़ी चाल या असमंजस वाली रेंज)
                 if move_pct >= 1.0 or (0.45 < rng_pct < 0.85 and 0.30 < pos_rng < 0.70):
                     skipped_days += 1
                     continue
@@ -761,71 +775,115 @@ with pro_tab2:
                     mode_name = "Sideways Strangle (Leg SL)"
                     s_ce, s_pe = atm + (0 if dte == 0 else step), atm - (0 if dte == 0 else step)
                     b_ce, b_pe = s_ce + hedge, s_pe - hedge
-                    e_sce, e_spe = _bs_px(s1000, s_ce, t0, iv, "CE"), _bs_px(s1000, s_pe, t0, iv, "PE")
-                    e_bce, e_bpe = _bs_px(s1000, b_ce, t0, iv, "CE"), _bs_px(s1000, b_pe, t0, iv, "PE")
-                    credit_rs = ((e_sce + e_spe) - (e_bce + e_bpe)) * total_qty
+                    raw_sce, raw_spe = _bs_px(s1000, s_ce, t0, iv, "CE"), _bs_px(s1000, s_pe, t0, iv, "PE")
+                    raw_bce, raw_bpe = _bs_px(s1000, b_ce, t0, iv, "CE"), _bs_px(s1000, b_pe, t0, iv, "PE")
+
+                    e_sce = round(raw_sce - (max(0.4, raw_sce * 0.004) * slip_mult), 2)
+                    e_spe = round(raw_spe - (max(0.4, raw_spe * 0.004) * slip_mult), 2)
+                    e_bce = round(raw_bce + (max(0.4, raw_bce * 0.012) * slip_mult), 2)
+                    e_bpe = round(raw_bpe + (max(0.4, raw_bpe * 0.012) * slip_mult), 2)
+
                     ce_closed, pe_closed = False, False
                     ce_sl_px, pe_sl_px = e_sce * 1.35, e_spe * 1.35
-                    realized_ce, realized_pe = 0.0, 0.0
+                    x_sce, x_spe = e_sce, e_spe
                     status = "3:15 Exit ✅"
                     n_bars = len(sess)
+
                     for i_b, (_, row) in enumerate(sess.iterrows()):
                         tc = (dte + max(15.0, 315.0 * (1 - i_b / max(1, n_bars - 1))) / 375.0) / 365.0
                         c_sce = _bs_px(float(row["High"]), s_ce, tc, iv, "CE")
                         c_spe = _bs_px(float(row["Low"]), s_pe, tc, iv, "PE")
                         if not ce_closed and c_sce >= ce_sl_px:
                             ce_closed = True
-                            realized_ce = (e_sce - c_sce) * total_qty
-                            pe_sl_px = e_spe  # दूसरा लेग Cost पर शिफ्ट
+                            x_sce = c_sce + (max(0.4, c_sce * 0.008) * slip_mult)
+                            pe_sl_px = e_spe
                         if not pe_closed and c_spe >= pe_sl_px:
                             pe_closed = True
-                            realized_pe = (e_spe - c_spe) * total_qty
+                            x_spe = c_spe + (max(0.4, c_spe * 0.008) * slip_mult)
                             ce_sl_px = e_sce
                         if ce_closed and pe_closed:
                             status = "Both Leg SL ❌"
                             break
+
                     close_s = float(sess["Close"].iloc[-1])
                     t_end = (dte + 15.0 / 375.0) / 365.0
                     if not ce_closed:
-                        realized_ce = (e_sce - _bs_px(close_s, s_ce, t_end, iv, "CE")) * total_qty
+                        raw_xce = _bs_px(close_s, s_ce, t_end, iv, "CE")
+                        x_sce = raw_xce + (max(0.4, raw_xce * 0.004) * slip_mult)
                     if not pe_closed:
-                        realized_pe = (e_spe - _bs_px(close_s, s_pe, t_end, iv, "PE")) * total_qty
-                    hedge_pnl = ((_bs_px(close_s, b_ce, t_end, iv, "CE") - e_bce) + (_bs_px(close_s, b_pe, t_end, iv, "PE") - e_bpe)) * total_qty
-                    net_rs = round(realized_ce + realized_pe + hedge_pnl - (140 * pbt_lots), 0)
+                        raw_xpe = _bs_px(close_s, s_pe, t_end, iv, "PE")
+                        x_spe = raw_xpe + (max(0.4, raw_xpe * 0.004) * slip_mult)
+
+                    raw_xbce = _bs_px(close_s, b_ce, t_end, iv, "CE")
+                    raw_xbpe = _bs_px(close_s, b_pe, t_end, iv, "PE")
+                    x_bce = max(0.05, raw_xbce - (max(0.4, raw_xbce * 0.012) * slip_mult))
+                    x_bpe = max(0.05, raw_xbpe - (max(0.4, raw_xbpe * 0.012) * slip_mult))
+
+                    gross_rs = ((e_sce - x_sce) + (e_spe - x_spe) + (x_bce - e_bce) + (x_bpe - e_bpe)) * total_qty
+                    sell_to = (e_sce + e_spe + x_bce + x_bpe) * total_qty
+                    buy_to = (e_bce + e_bpe + x_sce + x_spe) * total_qty
+                    charges = _calc_pro_angel_charges(sell_to, buy_to, 8) if pbt_deduct_costs else 0.0
+                    total_costs_paid += charges
+                    net_rs = round(gross_rs - charges, 0)
+
                 else:
                     is_up = (pos_rng >= 0.70)
                     mode_name = f"{'Bull Put' if is_up else 'Bear Call'} (0.25Δ OTM)"
                     side = "PE" if is_up else "CE"
                     sk = (atm - otm_off) if is_up else (atm + otm_off)
                     bk = (sk - hedge) if is_up else (sk + hedge)
-                    es, eb = _bs_px(s1000, sk, t0, iv, side), _bs_px(s1000, bk, t0, iv, side)
+                    raw_es, raw_eb = _bs_px(s1000, sk, t0, iv, side), _bs_px(s1000, bk, t0, iv, side)
+
+                    es = round(raw_es - (max(0.4, raw_es * 0.004) * slip_mult), 2)
+                    eb = round(raw_eb + (max(0.4, raw_eb * 0.012) * slip_mult), 2)
+
                     credit_rs = max(500.0, (es - eb) * total_qty)
                     hard_sl = max(1200.0 * pbt_lots, credit_rs * 0.38)
                     target = credit_rs * 0.65
                     status = "3:15 Exit ✅"
                     n_bars = len(sess)
-                    final_pnl = 0.0
+                    xs, xb = es, eb
+
                     for i_b, (_, row) in enumerate(sess.iterrows()):
                         tc = (dte + max(15.0, 315.0 * (1 - i_b / max(1, n_bars - 1))) / 375.0) / 365.0
                         w_s = float(row["Low"]) if is_up else float(row["High"])
                         b_s = float(row["High"]) if is_up else float(row["Low"])
-                        worst_mtm = ((es - _bs_px(w_s, sk, tc, iv, side)) + (_bs_px(w_s, bk, tc, iv, side) - eb)) * total_qty
-                        best_mtm = ((es - _bs_px(b_s, sk, tc, iv, side)) + (_bs_px(b_s, bk, tc, iv, side) - eb)) * total_qty
+                        w_cs, w_cb = _bs_px(w_s, sk, tc, iv, side), _bs_px(w_s, bk, tc, iv, side)
+                        b_cs, b_cb = _bs_px(b_s, sk, tc, iv, side), _bs_px(b_s, bk, tc, iv, side)
+                        worst_mtm = ((es - w_cs) + (w_cb - eb)) * total_qty
+                        best_mtm = ((es - b_cs) + (b_cb - eb)) * total_qty
                         if worst_mtm <= -hard_sl:
                             status = "38% Credit SL ❌"
-                            final_pnl = -hard_sl
+                            xs = w_cs + (max(0.4, w_cs * 0.008) * slip_mult)
+                            xb = max(0.05, w_cb - (max(0.4, w_cb * 0.012) * slip_mult))
                             break
                         if best_mtm >= target:
                             status = "65% Target 🎯"
-                            final_pnl = target
+                            xs = b_cs + (max(0.4, b_cs * 0.004) * slip_mult)
+                            xb = max(0.05, b_cb - (max(0.4, b_cb * 0.012) * slip_mult))
                             break
+
                     if status == "3:15 Exit ✅":
                         cs = float(sess["Close"].iloc[-1])
                         te = (dte + 15.0 / 375.0) / 365.0
-                        final_pnl = ((es - _bs_px(cs, sk, te, iv, side)) + (_bs_px(cs, bk, te, iv, side) - eb)) * total_qty
-                    net_rs = round(final_pnl - (110 * pbt_lots), 0)
+                        raw_xs, raw_xb = _bs_px(cs, sk, te, iv, side), _bs_px(cs, bk, te, iv, side)
+                        xs = raw_xs + (max(0.4, raw_xs * 0.004) * slip_mult)
+                        xb = max(0.05, raw_xb - (max(0.4, raw_xb * 0.012) * slip_mult))
 
-                logs.append({"तारीख": str(dt), "रणनीति": mode_name, "नतीजा": status, "शुद्ध लाभ/हानि (₹)": net_rs})
+                    gross_rs = ((es - xs) + (xb - eb)) * total_qty
+                    sell_to = (es + xb) * total_qty
+                    buy_to = (eb + xs) * total_qty
+                    charges = _calc_pro_angel_charges(sell_to, buy_to, 4) if pbt_deduct_costs else 0.0
+                    total_costs_paid += charges
+                    net_rs = round(gross_rs - charges, 0)
+
+                logs.append({
+                    "तारीख": str(dt),
+                    "रणनीति": mode_name,
+                    "नतीजा": status,
+                    "ब्रोकरेज+टैक्स (₹)": round(charges, 0),
+                    "शुद्ध लाभ/हानि (₹)": net_rs
+                })
 
             res_df = pd.DataFrame(logs)
             if not res_df.empty:
@@ -834,9 +892,9 @@ with pro_tab2:
                 wr = round((wins / len(res_df)) * 100, 1)
                 tot_p = res_df["शुद्ध लाभ/हानि (₹)"].sum()
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("कुल शुद्ध लाभ", f"₹{tot_p:,.0f}", f"{len(res_df)} ट्रेड लिए")
+                m1.metric("कुल शुद्ध लाभ (Net)", f"₹{tot_p:,.0f}", f"{len(res_df)} ट्रेड लिए")
                 m2.metric("सटीकता (Win Rate)", f"{wr}%", f"{wins} जीत / {len(res_df)-wins} हार")
                 m3.metric("बचाए गए No-Trade दिन", f"{skipped_days} दिन", "खराब बाज़ार स्किप")
-                m4.metric("औसत प्रति ट्रेड", f"₹{round(tot_p/len(res_df), 0):,.0f}")
+                m4.metric("कुल ब्रोकरेज + टैक्स", f"-₹{int(total_costs_paid):,}", "Slippage सहित" if pbt_deduct_costs else "Costs OFF")
                 st.line_chart(res_df.set_index("तारीख")["कुल पूंजी वक्र (₹)"])
                 st.dataframe(res_df, use_container_width=True, hide_index=True)
