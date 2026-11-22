@@ -5,6 +5,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
+import pyotp
 
 
 def _norm_cdf(x):
@@ -16,7 +17,7 @@ def _norm_pdf(x):
 
 
 def _implied_volatility(option_price, spot, strike, t_years, opt_type="CE"):
-    """ऑप्शन के लाइव प्राइस (LTP) से सटीक IV निकालना"""
+    """ऑप्शन के असली लाइव प्राइस (LTP) से सटीक IV निकालना"""
     if option_price <= 0.5 or t_years <= 1e-6 or spot <= 0 or strike <= 0:
         return 0.15
 
@@ -33,7 +34,7 @@ def _implied_volatility(option_price, spot, strike, t_years, opt_type="CE"):
         if opt_type == "CE":
             px = spot * _norm_cdf(d1) - strike * math.exp(-r * t_years) * _norm_cdf(d2)
         else:
-            px = strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * math.exp(-r * t_years) * 0 - spot * _norm_cdf(-d1)
+            px = strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
         if px > option_price:
             high = mid
@@ -83,6 +84,152 @@ def _get_time_to_expiry_years(expiry_str):
         return 2.0 / 365.0
 
 
+@st.cache_data(ttl=3600)
+def _get_scrip_master():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    res = requests.get(url, timeout=15)
+    return pd.DataFrame(res.json())
+
+
+def _ensure_angel_login():
+    """अगर सेशन में लॉगिन नहीं है तो Secrets से अपने आप लॉगिन करना"""
+    if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+        return st.session_state["angel_jwt"], st.session_state["angel_key"]
+    try:
+        if "ANGEL_API_KEY" in st.secrets and "ANGEL_CLIENT_ID" in st.secrets:
+            api_key = st.secrets["ANGEL_API_KEY"].strip()
+            client_id = st.secrets["ANGEL_CLIENT_ID"].strip()
+            mpin = st.secrets["ANGEL_MPIN"].strip()
+            totp = pyotp.TOTP(st.secrets["ANGEL_TOTP"].strip().replace(" ", "")).now()
+
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-UserType": "USER",
+                "X-SourceID": "WEB",
+                "X-ClientLocalIP": "127.0.0.1",
+                "X-ClientPublicIP": "127.0.0.1",
+                "X-MACAddress": "00:00:00:00:00:00",
+                "X-PrivateKey": api_key
+            }
+            res = requests.post(
+                "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
+                json={"clientcode": client_id, "password": mpin, "totp": totp},
+                headers=headers,
+                timeout=10
+            ).json()
+            if res.get("status") and res.get("data", {}).get("jwtToken"):
+                jwt = res["data"]["jwtToken"]
+                st.session_state["angel_jwt"] = jwt
+                st.session_state["angel_key"] = api_key
+                return jwt, api_key
+    except Exception:
+        pass
+    return None, None
+
+
+@st.cache_data(ttl=8)
+def _fetch_real_angel_option_chain(jwt_token, api_key, selected_idx):
+    """Angel One SmartAPI से असली Spot, Expiry, Call/Put LTP और Change in OI लाना"""
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "X-PrivateKey": api_key
+    }
+    quote_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
+
+    idx_info = {
+        "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50},
+        "Bank Nifty": {"exch": "NSE", "token": "99926009", "name": "BANKNIFTY", "opt_exch": "NFO", "step": 100},
+        "Sensex": {"exch": "BSE", "token": "99919000", "name": "SENSEX", "opt_exch": "BFO", "step": 100}
+    }[selected_idx]
+
+    try:
+        spot_res = requests.post(
+            quote_url,
+            json={"mode": "LTP", "exchangeTokens": {idx_info["exch"]: [idx_info["token"]]}},
+            headers=headers,
+            timeout=5
+        ).json()
+        if not spot_res.get("status"):
+            return None, None, "Simulation"
+        spot_price = float(spot_res["data"]["fetched"][0]["ltp"])
+    except Exception:
+        return None, None, "Simulation"
+
+    step = idx_info["step"]
+    atm_strike = round(spot_price / step) * step
+
+    try:
+        master_df = _get_scrip_master()
+        opt_df = master_df[
+            (master_df["name"] == idx_info["name"]) &
+            (master_df["exch_seg"] == idx_info["opt_exch"]) &
+            (master_df["instrumenttype"].isin(["OPTIDX"]))
+        ].copy()
+
+        opt_df["expiry_dt"] = pd.to_datetime(opt_df["expiry"], format="%d%b%Y", errors="coerce")
+        opt_df = opt_df.dropna(subset=["expiry_dt"])
+        today = pd.Timestamp.now().normalize()
+        future_expiries = sorted(opt_df[opt_df["expiry_dt"] >= today]["expiry_dt"].unique())
+        if not future_expiries:
+            return None, spot_price, "Simulation"
+
+        nearest_exp = future_expiries[0]
+        exp_str = pd.Timestamp(nearest_exp).strftime("%d-%b-%Y")
+        exp_df = opt_df[opt_df["expiry_dt"] == nearest_exp].copy()
+        exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
+        exp_df["opt_type"] = exp_df["symbol"].str[-2:]
+
+        min_s = atm_strike - (4 * step)
+        max_s = atm_strike + (4 * step)
+        target_df = exp_df[(exp_df["clean_strike"] >= min_s) & (exp_df["clean_strike"] <= max_s)].copy()
+        tokens = target_df["token"].astype(str).tolist()
+        if not tokens:
+            return None, spot_price, exp_str
+
+        contract_map = {}
+        for _, r in target_df.iterrows():
+            contract_map[(int(r["clean_strike"]), r["opt_type"])] = str(r["token"])
+
+        fetched_map = {}
+        q_res = requests.post(
+            quote_url,
+            json={"mode": "FULL", "exchangeTokens": {idx_info["opt_exch"]: tokens[:50]}},
+            headers=headers,
+            timeout=6
+        ).json()
+        if q_res.get("status") and q_res.get("data", {}).get("fetched"):
+            for item in q_res["data"]["fetched"]:
+                fetched_map[str(item["symbolToken"])] = item
+
+        if not fetched_map:
+            return None, spot_price, exp_str
+
+        rows = []
+        for st_val in sorted(target_df["clean_strike"].unique()):
+            ce_q = fetched_map.get(contract_map.get((st_val, "CE"), ""), {})
+            pe_q = fetched_map.get(contract_map.get((st_val, "PE"), ""), {})
+            rows.append({
+                "STRIKE": st_val,
+                "CALL LTP": float(ce_q.get("ltp", 0.0) or 0.0),
+                "PUT LTP": float(pe_q.get("ltp", 0.0) or 0.0),
+                "CALL OI": int(float(ce_q.get("opnInterest", 0) or 0)),
+                "PUT OI": int(float(pe_q.get("opnInterest", 0) or 0)),
+                "CALL CHG OI": int(float(ce_q.get("netChangeOpnInterest", 0) or 0)),
+                "PUT CHG OI": int(float(pe_q.get("netChangeOpnInterest", 0) or 0)),
+            })
+        return pd.DataFrame(rows), spot_price, exp_str
+    except Exception:
+        return None, spot_price, "Simulation"
+
+
 def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simulation"):
     """
     हर एक Greek (Delta, Theta, Gamma, IV) की पूरी हिंदी व्याख्या के साथ
@@ -107,6 +254,8 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
             "atm_theta": 0.0,
             "net_delta": 0.0,
             "atm_iv": 0.0,
+            "up_call_chg": 0,
+            "dn_put_chg": 0,
             "trade_plan": "अभी डेटा उपलब्ध नहीं है।",
             "delta_detail": "डेटा प्रतीक्षा...",
             "theta_detail": "डेटा प्रतीक्षा...",
@@ -231,6 +380,8 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
         "atm_theta": total_daily_theta,
         "net_delta": net_delta,
         "atm_iv": avg_iv_pct,
+        "up_call_chg": up_call_chg,
+        "dn_put_chg": dn_put_chg,
         "trade_plan": trade_plan,
         "delta_detail": delta_detail,
         "theta_detail": theta_detail,
@@ -245,13 +396,14 @@ def render_greeks_detail_box(selected_idx, spot_price, full_df, expiry_str="Simu
 
     st.markdown(f"""
     <div style="background: {g_info['bg_color']}; padding: 18px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin-top: 10px; margin-bottom: 12px;">
-        <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
+        <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx} | Expiry: {expiry_str})</div>
         <div style="font-size: 24px; font-weight: bold; margin-bottom: 6px;">{g_info['headline']}</div>
         <div style="font-size: 14px; color: #e2e8f0; margin-bottom: 8px;">{g_info['sub_headline']}</div>
         <div style="font-size: 15px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
     </div>
     """, unsafe_allow_html=True)
 
+    st.markdown(f"📊 **असली 3-Strike Change in OI:** ऊपर 3 Call Chg OI: `{g_info['up_call_chg']:+,}` &nbsp;|&nbsp; नीचे 3 Put Chg OI: `{g_info['dn_put_chg']:+,}`")
     st.markdown("#### 🔍 चारों Greeks की अलग-अलग डिटेल रिपोर्ट (कौन क्या कह रहा है):")
     c1, c2 = st.columns(2)
     with c1:
@@ -264,45 +416,25 @@ def render_greeks_detail_box(selected_idx, spot_price, full_df, expiry_str="Simu
     return g_info
 
 
-def _fetch_live_spot_and_df(selected_idx):
+def _get_full_live_data(selected_idx):
     sym_map = {
-        "Nifty 50": ("^NSEI", 50, 24000.0, "NSE", "99926000"),
-        "Bank Nifty": ("^NSEBANK", 100, 51000.0, "NSE", "99926009"),
-        "Sensex": ("^BSESN", 100, 79000.0, "BSE", "99919000"),
+        "Nifty 50": ("^NSEI", 50, 24000.0),
+        "Bank Nifty": ("^NSEBANK", 100, 51000.0),
+        "Sensex": ("^BSESN", 100, 79000.0),
     }
-    sym, step, def_spot, exch, tok = sym_map[selected_idx]
-    spot = None
+    sym, step, def_spot = sym_map[selected_idx]
 
-    if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
-        try:
-            headers = {
-                "Authorization": f"Bearer {st.session_state['angel_jwt']}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-UserType": "USER",
-                "X-SourceID": "WEB",
-                "X-ClientLocalIP": "127.0.0.1",
-                "X-ClientPublicIP": "127.0.0.1",
-                "X-MACAddress": "00:00:00:00:00:00",
-                "X-PrivateKey": st.session_state["angel_key"].strip()
-            }
-            res = requests.post(
-                "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/",
-                json={"mode": "LTP", "exchangeTokens": {exch: [tok]}},
-                headers=headers,
-                timeout=5
-            ).json()
-            if res.get("status"):
-                spot = float(res["data"]["fetched"][0]["ltp"])
-        except Exception:
-            pass
+    jwt, akey = _ensure_angel_login()
+    if jwt and akey:
+        live_df, live_spot, exp_str = _fetch_real_angel_option_chain(jwt, akey, selected_idx)
+        if live_df is not None and not live_df.empty and live_spot:
+            atm = round(live_spot / step) * step
+            return live_spot, atm, live_df, exp_str, True
 
-    if spot is None:
-        data = yf.download(sym, period="1d", interval="1m", progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
-
+    data = yf.download(sym, period="1d", interval="1m", progress=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
     atm = round(spot / step) * step
     strikes = [atm + (i * step) for i in range(-5, 6)]
     df_tmp = pd.DataFrame({
@@ -312,15 +444,26 @@ def _fetch_live_spot_and_df(selected_idx):
         "CALL LTP": [max(5.0, round(max(0, spot - s) + 75, 1)) for s in strikes],
         "PUT LTP": [max(5.0, round(max(0, s - spot) + 75, 1)) for s in strikes],
     })
-    return spot, atm, df_tmp
+    return spot, atm, df_tmp, "Simulation", False
 
 
 def _run_standalone_page():
-    st.subheader("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (पूरी डिटेल)")
-    sel = st.selectbox("इंडेक्स चुनें:", ["Nifty 50", "Bank Nifty", "Sensex"], key="standalone_greeks_idx")
-    spot, atm, df_tmp = _fetch_live_spot_and_df(sel)
-    st.caption(f"📍 **{sel} Spot:** `{spot:,.2f}` | 🎯 **ATM Strike:** `{atm}`")
-    render_greeks_detail_box(sel, spot, df_tmp, "Simulation")
+    st.subheader("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (100% Real Angel One Data)")
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        sel = st.selectbox("इंडेक्स चुनें:", ["Nifty 50", "Bank Nifty", "Sensex"], key="standalone_greeks_idx")
+    with col_b:
+        st.write("")
+        st.write("")
+        if st.button("🔄 डेटा रिफ्रेश करें", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    spot, atm, df_live, exp_str, is_real = _get_full_live_data(sel)
+    ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%I:%M:%S %p")
+    badge = f"🟢 **ANGEL ONE LIVE OPTION CHAIN (Expiry: {exp_str})**" if is_real else "🟡 **OFF-MARKET / DEMO MODE**"
+    st.caption(f"{badge} | ⏱️ **समय:** `{ist_now}` | 📍 **{sel} Spot:** `{spot:,.2f}` | 🎯 **ATM:** `{atm}`")
+    render_greeks_detail_box(sel, spot, df_live, exp_str)
 
 
 if __name__ == "__main__" or __name__ in ["greeks_regime_indicator", "greek_regime_indicator"]:
