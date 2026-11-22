@@ -198,3 +198,41 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
         "atm_iv": avg_iv_pct,
         "trade_plan": trade_plan
     }
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import pytz
+
+if __name__ == "__main__" or "streamlit" in globals():
+    st.subheader("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (सभी इंडेक्स)")
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+
+    for idx_name, sym, step, def_spot in [
+        ("Nifty 50", "^NSEI", 50, 24000.0),
+        ("Bank Nifty", "^NSEBANK", 100, 51000.0),
+        ("Sensex", "^BSESN", 100, 79000.0),
+    ]:
+        data = yf.download(sym, period="1d", interval="1m", progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
+        atm = round(spot / step) * step
+        strikes = [atm + (i * step) for i in range(-5, 6)]
+        df_tmp = pd.DataFrame({
+            "STRIKE": strikes,
+            "CALL CHG OI": [0 for _ in strikes],
+            "PUT CHG OI": [0 for _ in strikes],
+            "CALL LTP": [max(5.0, round(max(0, spot - s) + 75, 1)) for s in strikes],
+            "PUT LTP": [max(5.0, round(max(0, s - spot) + 75, 1)) for s in strikes],
+        })
+        info = evaluate_greeks_regime(idx_name, spot, df_tmp, "Simulation")
+        st.markdown(f"""
+        <div style="background: {info['bg_color']}; padding: 14px 18px; border-radius: 10px; border-left: 6px solid {info['border_color']}; color: white; margin-bottom: 10px;">
+            <div style="font-size: 13px; color: #cbd5e1;">📍 {idx_name} Spot: {spot:,.2f}</div>
+            <div style="font-size: 20px; font-weight: bold;">{info['headline']}</div>
+            <div style="font-size: 14px; color: #fde047;">👉 {info['trade_plan']}</div>
+        </div>
+        """, unsafe_allow_html=True)
