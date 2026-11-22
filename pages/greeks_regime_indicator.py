@@ -4,6 +4,7 @@ import pytz
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
 
 
 def _norm_cdf(x):
@@ -32,7 +33,7 @@ def _implied_volatility(option_price, spot, strike, t_years, opt_type="CE"):
         if opt_type == "CE":
             px = spot * _norm_cdf(d1) - strike * math.exp(-r * t_years) * _norm_cdf(d2)
         else:
-            px = strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+            px = strike * math.exp(-r * t_years) * _norm_cdf(-d2) - spot * math.exp(-r * t_years) * 0 - spot * _norm_cdf(-d1)
 
         if px > option_price:
             high = mid
@@ -263,21 +264,45 @@ def render_greeks_detail_box(selected_idx, spot_price, full_df, expiry_str="Simu
     return g_info
 
 
-# अगर कोई बाईं तरफ़ के मेनू से सीधे इस पेज को खोले तो भी पूरी डिटेल दिखेगी
-if __name__ == "__main__":
-    st.set_page_config(page_title="Greeks Market Regime", layout="wide")
-    st.title("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (पूरी डिटेल)")
-    sel = st.selectbox("इंडेक्स चुनें:", ["Nifty 50", "Bank Nifty", "Sensex"])
+def _fetch_live_spot_and_df(selected_idx):
     sym_map = {
-        "Nifty 50": ("^NSEI", 50, 24000.0),
-        "Bank Nifty": ("^NSEBANK", 100, 51000.0),
-        "Sensex": ("^BSESN", 100, 79000.0),
+        "Nifty 50": ("^NSEI", 50, 24000.0, "NSE", "99926000"),
+        "Bank Nifty": ("^NSEBANK", 100, 51000.0, "NSE", "99926009"),
+        "Sensex": ("^BSESN", 100, 79000.0, "BSE", "99919000"),
     }
-    sym, step, def_spot = sym_map[sel]
-    data = yf.download(sym, period="1d", interval="1m", progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
+    sym, step, def_spot, exch, tok = sym_map[selected_idx]
+    spot = None
+
+    if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+        try:
+            headers = {
+                "Authorization": f"Bearer {st.session_state['angel_jwt']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-UserType": "USER",
+                "X-SourceID": "WEB",
+                "X-ClientLocalIP": "127.0.0.1",
+                "X-ClientPublicIP": "127.0.0.1",
+                "X-MACAddress": "00:00:00:00:00:00",
+                "X-PrivateKey": st.session_state["angel_key"].strip()
+            }
+            res = requests.post(
+                "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/",
+                json={"mode": "LTP", "exchangeTokens": {exch: [tok]}},
+                headers=headers,
+                timeout=5
+            ).json()
+            if res.get("status"):
+                spot = float(res["data"]["fetched"][0]["ltp"])
+        except Exception:
+            pass
+
+    if spot is None:
+        data = yf.download(sym, period="1d", interval="1m", progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
+
     atm = round(spot / step) * step
     strikes = [atm + (i * step) for i in range(-5, 6)]
     df_tmp = pd.DataFrame({
@@ -287,4 +312,16 @@ if __name__ == "__main__":
         "CALL LTP": [max(5.0, round(max(0, spot - s) + 75, 1)) for s in strikes],
         "PUT LTP": [max(5.0, round(max(0, s - spot) + 75, 1)) for s in strikes],
     })
+    return spot, atm, df_tmp
+
+
+def _run_standalone_page():
+    st.subheader("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (पूरी डिटेल)")
+    sel = st.selectbox("इंडेक्स चुनें:", ["Nifty 50", "Bank Nifty", "Sensex"], key="standalone_greeks_idx")
+    spot, atm, df_tmp = _fetch_live_spot_and_df(sel)
+    st.caption(f"📍 **{sel} Spot:** `{spot:,.2f}` | 🎯 **ATM Strike:** `{atm}`")
     render_greeks_detail_box(sel, spot, df_tmp, "Simulation")
+
+
+if __name__ == "__main__" or __name__ in ["greeks_regime_indicator", "greek_regime_indicator"]:
+    _run_standalone_page()
