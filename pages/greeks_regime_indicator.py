@@ -1,6 +1,9 @@
 import math
 from datetime import datetime
 import pytz
+import streamlit as st
+import yfinance as yf
+import pandas as pd
 
 
 def _norm_cdf(x):
@@ -81,11 +84,8 @@ def _get_time_to_expiry_years(expiry_str):
 
 def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simulation"):
     """
-    Greeks (Theta/Delta Efficiency + Gamma-IV) और 3-Strike OI/IV Skew के आधार पर
-    साफ़ हिंदी में बताता है:
-    1) आज मार्केट ऊपर जा सकता है
-    2) आज मार्केट नीचे जा सकता है
-    3) आज मार्केट साइडवेज रहेगा
+    हर एक Greek (Delta, Theta, Gamma, IV) की पूरी हिंदी व्याख्या के साथ
+    बाज़ार का साफ़ फैसला देता है।
     """
     step_map = {"Nifty 50": 50, "Bank Nifty": 100, "Sensex": 100}
     hedge_map = {"Nifty 50": 300, "Bank Nifty": 300, "Sensex": 1000}
@@ -106,7 +106,11 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
             "atm_theta": 0.0,
             "net_delta": 0.0,
             "atm_iv": 0.0,
-            "trade_plan": "अभी डेटा उपलब्ध नहीं है।"
+            "trade_plan": "अभी डेटा उपलब्ध नहीं है।",
+            "delta_detail": "डेटा प्रतीक्षा...",
+            "theta_detail": "डेटा प्रतीक्षा...",
+            "gamma_detail": "डेटा प्रतीक्षा...",
+            "iv_detail": "डेटा प्रतीक्षा..."
         }
 
     ce_ltp = float(atm_row["CALL LTP"].iloc[0])
@@ -119,21 +123,51 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
     ce_g = _calc_bs_greeks(spot_price, atm_strike, t_years, ce_iv, "CE")
     pe_g = _calc_bs_greeks(spot_price, atm_strike, t_years, pe_iv, "PE")
 
-    # 1. Theta और Delta हिसाब
-    total_daily_theta = abs(ce_g["theta"]) + abs(pe_g["theta"])
+    # 1. Theta हिसाब और हिंदी सिग्नल
+    ce_theta_abs = round(abs(ce_g["theta"]), 2)
+    pe_theta_abs = round(abs(pe_g["theta"]), 2)
+    total_daily_theta = round(ce_theta_abs + pe_theta_abs, 2)
+
+    if total_daily_theta >= 18.0:
+        theta_detail = f"🟢 तेज़ प्रीमियम गलन (कुल ₹{total_daily_theta}/दिन | Call: ₹{ce_theta_abs}, Put: ₹{pe_theta_abs}) — ऑप्शन बेचने वालों को तेज़ी से प्रॉफिट मिल रहा है।"
+    else:
+        theta_detail = f"🟡 धीमी प्रीमियम गलन (कुल ₹{total_daily_theta}/दिन | Call: ₹{ce_theta_abs}, Put: ₹{pe_theta_abs}) — अभी समय के साथ प्रीमियम धीरे गलेगा।"
+
+    # 2. Delta हिसाब और हिंदी सिग्नल
     net_delta = round(ce_g["delta"] + pe_g["delta"], 3)
     abs_net_delta = abs(net_delta)
 
+    if net_delta >= 0.06:
+        delta_detail = f"🟢 ऊपर जाने का सिग्नल (Net Delta: {net_delta:+} | Call: {ce_g['delta']}, Put: {pe_g['delta']}) — खरीदार बाज़ार को ऊपर खींच रहे हैं।"
+    elif net_delta <= -0.06:
+        delta_detail = f"🔴 नीचे जाने का सिग्नल (Net Delta: {net_delta:+} | Call: {ce_g['delta']}, Put: {pe_g['delta']}) — बाज़ार पर नीचे की तरफ़ दबाव है।"
+    else:
+        delta_detail = f"🟡 साइडवेज / संतुलित सिग्नल (Net Delta: {net_delta:+} | Call: {ce_g['delta']}, Put: {pe_g['delta']}) — ऊपर और नीचे दोनों तरफ़ बराबर ताकत है।"
+
+    # 3. Gamma और Gamma-IV दबाव हिसाब और हिंदी सिग्नल
     one_pct_move = spot_price * 0.01
     delta_point_risk = max(1.0, abs_net_delta * one_pct_move)
     theta_delta_eff = round((total_daily_theta / delta_point_risk) * 10.0, 2)
 
-    # 2. Gamma-IV दबाव (0 से 100)
-    avg_gamma = (ce_g["gamma"] + pe_g["gamma"]) / 2.0
+    avg_gamma = round((ce_g["gamma"] + pe_g["gamma"]) / 2.0, 6)
     avg_iv_pct = round((ce_g["iv_pct"] + pe_g["iv_pct"]) / 2.0, 2)
     gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
 
-    # 3. ऊपर 3 Call बनाम नीचे 3 Put Change in OI दिशा
+    if gamma_iv_risk >= 52.0:
+        gamma_detail = f"🔴 तेज़ हलचल / ब्रेकआउट खतरा (Gamma-IV स्कोर: {gamma_iv_risk}/100 | Gamma: {avg_gamma}) — बाज़ार में अचानक बड़ा मूव आ सकता है, स्टॉप-लॉस सख्त रखें।"
+    else:
+        gamma_detail = f"🟢 शांत और स्थिर बाज़ार (Gamma-IV स्कोर: {gamma_iv_risk}/100 | Gamma: {avg_gamma}) — अचानक तेज़ भागने का खतरा कम है, सेलिंग सुरक्षित है।"
+
+    # 4. IV (Implied Volatility) तुलना और हिंदी सिग्नल
+    iv_diff = round(pe_g["iv_pct"] - ce_g["iv_pct"], 2)
+    if iv_diff > 1.2:
+        iv_detail = f"🟢 Put IV ज़्यादा है (Put IV: {pe_g['iv_pct']}% बनाम Call IV: {ce_g['iv_pct']}%) — नीचे के स्तरों पर मज़बूत सपोर्ट और ऊपर जाने का संकेत।"
+    elif iv_diff < -1.2:
+        iv_detail = f"🔴 Call IV ज़्यादा है (Call IV: {ce_g['iv_pct']}% बनाम Put IV: {pe_g['iv_pct']}%) — ऊपर से बिकवाली का दबाव और नीचे जाने का संकेत।"
+    else:
+        iv_detail = f"🟡 Call और Put IV बराबर हैं (Call IV: {ce_g['iv_pct']}% | Put IV: {pe_g['iv_pct']}%) — बाज़ार में कोई बड़ा डर नहीं है, रेंज में रहने के आसार।"
+
+    # 5. ऊपर 3 Call बनाम नीचे 3 Put Change in OI दिशा
     up_3_df = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3 * step)]
     dn_3_df = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3 * step)]
     up_call_chg = int(up_3_df["CALL CHG OI"].sum()) if not up_3_df.empty else 0
@@ -152,32 +186,32 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
     elif net_delta <= -0.06:
         bearish_points += 1
 
-    if pe_g["iv_pct"] > ce_g["iv_pct"] + 1.2:
+    if iv_diff > 1.2:
         bullish_points += 1
-    elif ce_g["iv_pct"] > pe_g["iv_pct"] + 1.2:
+    elif iv_diff < -1.2:
         bearish_points += 1
 
-    # 4. साफ़-साफ़ अंतिम फैसला (ऊपर / नीचे / साइडवेज)
+    # 6. अंतिम बड़ा फैसला
     is_strong_trend = (gamma_iv_risk >= 52.0) or (abs_net_delta >= 0.14) or (abs(bullish_points - bearish_points) >= 2)
 
     if is_strong_trend and bullish_points > bearish_points:
         direction = "UP"
         headline = "🟢 आज मार्केट ऊपर जा सकता है (BULLISH)"
-        sub_headline = f"नीचे की Put राइटिंग मज़बूत है और Delta ऊपर की तरफ़ इशारा कर रहा है (Gamma-IV स्कोर: {gamma_iv_risk}/100)"
+        sub_headline = f"नीचे की Put राइटिंग मज़बूत है और Delta/IV ऊपर की तरफ़ इशारा कर रहे हैं (Theta/Delta क्षमता: {theta_delta_eff})"
         bg_color = "linear-gradient(90deg, #064e3b, #022c22)"
         border_color = "#10b981"
         trade_plan = f"क्या करें: {atm_strike} PE बेचें और {atm_strike - hedge_pts} PE हेज खरीदें (Bull Put Spread)।"
     elif is_strong_trend and bearish_points > bullish_points:
         direction = "DOWN"
         headline = "🔴 आज मार्केट नीचे जा सकता है (BEARISH)"
-        sub_headline = f"ऊपर की Call राइटिंग भारी है और गिरावट का दबाव दिख रहा है (Gamma-IV स्कोर: {gamma_iv_risk}/100)"
+        sub_headline = f"ऊपर की Call राइटिंग भारी है और Delta/IV गिरावट का दबाव दिखा रहे हैं (Theta/Delta क्षमता: {theta_delta_eff})"
         bg_color = "linear-gradient(90deg, #7f1d1d, #450a0a)"
         border_color = "#ef4444"
         trade_plan = f"क्या करें: {atm_strike} CE बेचें और {atm_strike + hedge_pts} CE हेज खरीदें (Bear Call Spread)।"
     else:
         direction = "SIDEWAYS"
         headline = "🟡 आज मार्केट साइडवेज रहेगा (RANGE-BOUND)"
-        sub_headline = f"Theta गलन तेज़ है (₹{round(total_daily_theta, 1)}/दिन) और Gamma-IV शांत है ({gamma_iv_risk}/100) — बाज़ार एक दायरे में रहेगा"
+        sub_headline = f"Theta गलन तेज़ है (₹{total_daily_theta}/दिन) और Gamma-IV शांत है ({gamma_iv_risk}/100) — बाज़ार एक दायरे में रहेगा"
         bg_color = "linear-gradient(90deg, #78350f, #451a03)"
         border_color = "#f59e0b"
         if dn_put_chg >= up_call_chg:
@@ -193,46 +227,64 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
         "border_color": border_color,
         "efficiency_score": theta_delta_eff,
         "gamma_iv_risk": gamma_iv_risk,
-        "atm_theta": round(total_daily_theta, 2),
+        "atm_theta": total_daily_theta,
         "net_delta": net_delta,
         "atm_iv": avg_iv_pct,
-        "trade_plan": trade_plan
+        "trade_plan": trade_plan,
+        "delta_detail": delta_detail,
+        "theta_detail": theta_detail,
+        "gamma_detail": gamma_detail,
+        "iv_detail": iv_detail
     }
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import pytz
 
-if __name__ == "__main__" or "streamlit" in globals():
-    st.subheader("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (सभी इंडेक्स)")
-    ist = pytz.timezone("Asia/Kolkata")
-    now_ist = datetime.now(ist)
 
-    for idx_name, sym, step, def_spot in [
-        ("Nifty 50", "^NSEI", 50, 24000.0),
-        ("Bank Nifty", "^NSEBANK", 100, 51000.0),
-        ("Sensex", "^BSESN", 100, 79000.0),
-    ]:
-        data = yf.download(sym, period="1d", interval="1m", progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
-        atm = round(spot / step) * step
-        strikes = [atm + (i * step) for i in range(-5, 6)]
-        df_tmp = pd.DataFrame({
-            "STRIKE": strikes,
-            "CALL CHG OI": [0 for _ in strikes],
-            "PUT CHG OI": [0 for _ in strikes],
-            "CALL LTP": [max(5.0, round(max(0, spot - s) + 75, 1)) for s in strikes],
-            "PUT LTP": [max(5.0, round(max(0, s - spot) + 75, 1)) for s in strikes],
-        })
-        info = evaluate_greeks_regime(idx_name, spot, df_tmp, "Simulation")
-        st.markdown(f"""
-        <div style="background: {info['bg_color']}; padding: 14px 18px; border-radius: 10px; border-left: 6px solid {info['border_color']}; color: white; margin-bottom: 10px;">
-            <div style="font-size: 13px; color: #cbd5e1;">📍 {idx_name} Spot: {spot:,.2f}</div>
-            <div style="font-size: 20px; font-weight: bold;">{info['headline']}</div>
-            <div style="font-size: 14px; color: #fde047;">👉 {info['trade_plan']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+def render_greeks_detail_box(selected_idx, spot_price, full_df, expiry_str="Simulation"):
+    """स्क्रीन पर बड़ा बैनर + चारों Greeks की पूरी हिंदी व्याख्या दिखाने वाला फंक्शन"""
+    g_info = evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str)
+
+    st.markdown(f"""
+    <div style="background: {g_info['bg_color']}; padding: 18px 20px; border-radius: 12px; border-left: 6px solid {g_info['border_color']}; color: white; margin-top: 10px; margin-bottom: 12px;">
+        <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">🧭 Greeks + OI बाज़ार का साफ़ फैसला ({selected_idx})</div>
+        <div style="font-size: 24px; font-weight: bold; margin-bottom: 6px;">{g_info['headline']}</div>
+        <div style="font-size: 14px; color: #e2e8f0; margin-bottom: 8px;">{g_info['sub_headline']}</div>
+        <div style="font-size: 15px; font-weight: bold; color: #fde047;">👉 {g_info['trade_plan']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("#### 🔍 चारों Greeks की अलग-अलग डिटेल रिपोर्ट (कौन क्या कह रहा है):")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.info(f"**1️⃣ Delta (दिशा की ताकत):**\n\n{g_info['delta_detail']}")
+        st.warning(f"**3️⃣ Gamma (अचानक झटके का खतरा):**\n\n{g_info['gamma_detail']}")
+    with c2:
+        st.success(f"**2️⃣ Theta (प्रीमियम गलन / सेलर प्रॉफिट):**\n\n{g_info['theta_detail']}")
+        st.info(f"**4️⃣ IV (ऑप्शन की मँहगाई और डर):**\n\n{g_info['iv_detail']}")
+
+    return g_info
+
+
+# अगर कोई बाईं तरफ़ के मेनू से सीधे इस पेज को खोले तो भी पूरी डिटेल दिखेगी
+if __name__ == "__main__":
+    st.set_page_config(page_title="Greeks Market Regime", layout="wide")
+    st.title("🧭 लाइव Greeks बाज़ार दिशा इंडिकेटर (पूरी डिटेल)")
+    sel = st.selectbox("इंडेक्स चुनें:", ["Nifty 50", "Bank Nifty", "Sensex"])
+    sym_map = {
+        "Nifty 50": ("^NSEI", 50, 24000.0),
+        "Bank Nifty": ("^NSEBANK", 100, 51000.0),
+        "Sensex": ("^BSESN", 100, 79000.0),
+    }
+    sym, step, def_spot = sym_map[sel]
+    data = yf.download(sym, period="1d", interval="1m", progress=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    spot = float(data["Close"].iloc[-1]) if not data.empty else def_spot
+    atm = round(spot / step) * step
+    strikes = [atm + (i * step) for i in range(-5, 6)]
+    df_tmp = pd.DataFrame({
+        "STRIKE": strikes,
+        "CALL CHG OI": [0 for _ in strikes],
+        "PUT CHG OI": [0 for _ in strikes],
+        "CALL LTP": [max(5.0, round(max(0, spot - s) + 75, 1)) for s in strikes],
+        "PUT LTP": [max(5.0, round(max(0, s - spot) + 75, 1)) for s in strikes],
+    })
+    render_greeks_detail_box(sel, spot, df_tmp, "Simulation")
