@@ -2,15 +2,16 @@ import streamlit as st
 
 mode = st.radio(
     "Select Mode:",
-    ["🚀 Live/Paper Algo Terminal", "🧠 Smart 4-Layer Pro Algo", "📊 Manual Options Simulator"],
+    ["🚀 Live/Paper Algo Terminal (पुराना)", "🧠 Smart 4-Layer Pro Algo (नया)", "📊 Manual Options Simulator"],
     horizontal=True
 )
 if mode == "📊 Manual Options Simulator":
     exec(open("pages/simulator.py", encoding="utf-8").read())
     st.stop()
-elif mode == "🧠 Smart 4-Layer Pro Algo":
+elif mode == "🧠 Smart 4-Layer Pro Algo (नया)":
     exec(open("pages/pro_algo.py", encoding="utf-8").read())
     st.stop()
+
 
 import yfinance as yf
 import pandas as pd
@@ -432,7 +433,7 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
     exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
-    # हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
+    # नए हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
     max_hedge = {"Nifty 50": 500, "Bank Nifty": 1000, "Sensex": 1500}[selected_idx]
     fetch_span = max(s_range * step, max_hedge + step, 3 * step)
     min_s = atm_strike - fetch_span
@@ -638,7 +639,7 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
             executed_so_far.append(lg)
             time.sleep(0.35)
 
-    # स्टॉप-लॉस: ₹1,700 प्रति लॉट
+    # नया स्टॉप-लॉस: ₹1,700 प्रति लॉट
     sl_limit = 1700.0 * lots
     new_trade = {
         "mode": mode,
@@ -899,7 +900,7 @@ with tab1:
 
         tg_cmd = check_telegram_commands()
 
-        # हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
+        # नए हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
         if selected_idx == "Nifty 50":
             sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 500, 75
         elif selected_idx == "Bank Nifty":
@@ -1204,7 +1205,7 @@ with tab2:
         st.caption(f"{data_badge} | ⏱️ **अपडेट (IST):** `{now_str}` | 📍 **Spot:** `{spot_price:,.2f}` | 🎯 **ATM:** `{atm_strike}`")
         st.markdown(f"📊 **ऊपर की 3 स्ट्राइक कुल Call Change in OI:** `{up_3_call_chg:+,}` &nbsp;&nbsp;|&nbsp;&nbsp; **नीचे की 3 स्ट्राइक कुल Put Change in OI:** `{down_3_put_chg:+,}`")
 
-        # --- OTM 3-Strike IV इंडिकेटर ---
+        # --- नया OTM 3-Strike IV इंडिकेटर (pages/otm_iv_indicator.py से) ---
         iv_info = evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label)
 
         iv_c1, iv_c2, iv_c3 = st.columns(3)
@@ -1250,10 +1251,10 @@ with tab2:
     render_seller_chain(idx, strike_range)
 
 # ==========================================
-# TAB 3: सुबह 10:00 AM Change in OI — High-Accuracy Backtest + DTE Filter & Breakdown
+# TAB 3: सुबह 10:00 AM Change in OI — High-Accuracy Backtest
 # ==========================================
 with tab3:
-    st.subheader("🎯 सुबह 10:00 AM — High-Accuracy बैकटेस्ट (0 DTE / 1 DTE / 2 DTE फ़िल्टर सहित)")
+    st.subheader("🎯 सुबह 10:00 AM — High-Accuracy बैकटेस्ट (1-Min Spot + Black-Scholes + Net Brokerage)")
 
     rec_days_count = 0
     if os.path.exists(OC_RECORD_FILE):
@@ -1294,256 +1295,211 @@ with tab3:
     with b4:
         deduct_costs = st.checkbox("ब्रोकरेज + टैक्स + स्लिपेज घटाएं", value=True)
 
-    # नया DTE फ़िल्टर विकल्प
-    dte_options = ["0 DTE (Expiry Day)", "1 DTE", "2 DTE", "3 DTE", "4 DTE"]
-    selected_dtes = st.multiselect(
-        "📅 कौन-कौन से DTE (Days to Expiry) का बैकटेस्ट देखना है? (चाहें तो एक चुनें या सभी चुनकर तुलना करें):",
-        options=dte_options,
-        default=dte_options,
-        key="bt_dte_select"
-    )
-    allowed_dte_nums = [int(x.split(" ")[0]) for x in selected_dtes]
-
     sl_per_lot = 1700.0
     total_sl_rs = sl_per_lot * lots
 
     if st.button("🚀 सटीक बैकटेस्ट चलाएं (Run Accurate Backtest)", use_container_width=True):
-        if not allowed_dte_nums:
-            st.warning("⚠️ कृपया कम से कम एक DTE (जैसे 0 DTE या 1 DTE) जरूर चुनें!")
+        if bt_idx == "Nifty 50":
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 500, 3, 0.135
+        elif bt_idx == "Bank Nifty":
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 1000, 2, 0.165
         else:
-            if bt_idx == "Nifty 50":
-                bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 500, 3, 0.135
-            elif bt_idx == "Bank Nifty":
-                bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 1000, 2, 0.165
+            bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1500, 4, 0.145
+
+        total_qty = lot_qty * lots
+        trade_col_name = f"ट्रेड (ATM + {hedge_points} Hedge)"
+        trade_logs = []
+
+        if "रिकॉर्डेड" in bt_source:
+            if not os.path.exists(OC_RECORD_FILE):
+                st.warning("अभी तक कोई रिकॉर्डेड डेटा फाइल नहीं बनी है। लाइव मार्केट के दौरान ऐप खोलें, डेटा अपने आप सेव होने लगेगा।")
             else:
-                bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^BSESN", 100, 20, 1500, 4, 0.145
-
-            total_qty = lot_qty * lots
-            trade_col_name = f"ट्रेड (ATM + {hedge_points} Hedge)"
-            trade_logs = []
-
-            if "रिकॉर्डेड" in bt_source:
-                if not os.path.exists(OC_RECORD_FILE):
-                    st.warning("अभी तक कोई रिकॉर्डेड डेटा फाइल नहीं बनी है। लाइव मार्केट के दौरान ऐप खोलें, डेटा अपने आप सेव होने लगेगा।")
+                rec_df = pd.read_csv(OC_RECORD_FILE)
+                rec_df = rec_df[rec_df["Index"] == bt_idx].copy()
+                if rec_df.empty:
+                    st.warning(f"{bt_idx} के लिए अभी तक कोई रिकॉर्डेड डेटा उपलब्ध नहीं है।")
                 else:
-                    rec_df = pd.read_csv(OC_RECORD_FILE)
-                    rec_df = rec_df[rec_df["Index"] == bt_idx].copy()
-                    if rec_df.empty:
-                        st.warning(f"{bt_idx} के लिए अभी तक कोई रिकॉर्डेड डेटा उपलब्ध नहीं है।")
-                    else:
-                        for dt, day_oc in rec_df.groupby("Date"):
-                            dt_parsed = pd.to_datetime(dt).date()
-                            dte_val = (expiry_weekday - dt_parsed.weekday()) % 7
-                            if dte_val not in allowed_dte_nums:
-                                continue
+                    for dt, day_oc in rec_df.groupby("Date"):
+                        day_oc = day_oc.sort_values("Timestamp")
+                        snap_10 = day_oc[(day_oc["Time"] >= "10:00") & (day_oc["Time"] <= "10:05")]
+                        if snap_10.empty:
+                            continue
+                        first_time = snap_10["Time"].iloc[0]
+                        oc_10 = snap_10[snap_10["Time"] == first_time]
+                        spot_1000 = float(oc_10["Spot"].iloc[0])
+                        atm_1000 = round(spot_1000 / step) * step
 
-                            day_oc = day_oc.sort_values("Timestamp")
-                            snap_10 = day_oc[(day_oc["Time"] >= "10:00") & (day_oc["Time"] <= "10:05")]
-                            if snap_10.empty:
-                                continue
-                            first_time = snap_10["Time"].iloc[0]
-                            oc_10 = snap_10[snap_10["Time"] == first_time]
-                            spot_1000 = float(oc_10["Spot"].iloc[0])
-                            atm_1000 = round(spot_1000 / step) * step
+                        up_3 = oc_10[(oc_10["STRIKE"] > atm_1000) & (oc_10["STRIKE"] <= atm_1000 + 3 * step)]
+                        dn_3 = oc_10[(oc_10["STRIKE"] < atm_1000) & (oc_10["STRIKE"] >= atm_1000 - 3 * step)]
+                        up_chg = int(up_3["CALL CHG OI"].sum())
+                        dn_chg = int(dn_3["PUT CHG OI"].sum())
 
-                            up_3 = oc_10[(oc_10["STRIKE"] > atm_1000) & (oc_10["STRIKE"] <= atm_1000 + 3 * step)]
-                            dn_3 = oc_10[(oc_10["STRIKE"] < atm_1000) & (oc_10["STRIKE"] >= atm_1000 - 3 * step)]
-                            up_chg = int(up_3["CALL CHG OI"].sum())
-                            dn_chg = int(dn_3["PUT CHG OI"].sum())
+                        if dn_chg >= up_chg:
+                            side, sell_k, buy_k = "PE", atm_1000, atm_1000 - hedge_points
+                            ltp_col = "PUT LTP"
+                        else:
+                            side, sell_k, buy_k = "CE", atm_1000, atm_1000 + hedge_points
+                            ltp_col = "CE LTP" if "CE LTP" in oc_10.columns else "CALL LTP"
 
-                            if dn_chg >= up_chg:
-                                side, sell_k, buy_k = "PE", atm_1000, atm_1000 - hedge_points
-                                ltp_col = "PUT LTP"
-                            else:
-                                side, sell_k, buy_k = "CE", atm_1000, atm_1000 + hedge_points
-                                ltp_col = "CE LTP" if "CE LTP" in oc_10.columns else "CALL LTP"
+                        s_row = oc_10[oc_10["STRIKE"] == sell_k]
+                        b_row = oc_10[oc_10["STRIKE"] == buy_k]
+                        if s_row.empty or b_row.empty:
+                            continue
 
-                            s_row = oc_10[oc_10["STRIKE"] == sell_k]
-                            b_row = oc_10[oc_10["STRIKE"] == buy_k]
-                            if s_row.empty or b_row.empty:
-                                continue
+                        sell_entry = float(s_row[ltp_col].iloc[0])
+                        buy_entry = float(b_row[ltp_col].iloc[0])
+                        legs_text = f"Sell {sell_k} {side} / Buy {buy_k} {side}"
 
-                            sell_entry = float(s_row[ltp_col].iloc[0])
-                            buy_entry = float(b_row[ltp_col].iloc[0])
-                            legs_text = f"Sell {sell_k} {side} / Buy {buy_k} {side}"
+                        after_10 = day_oc[(day_oc["Time"] >= first_time) & (day_oc["Time"] <= "15:15")]
+                        exit_status = "3:15 Exit ✅"
+                        curr_s, curr_b = sell_entry, buy_entry
 
-                            after_10 = day_oc[(day_oc["Time"] >= first_time) & (day_oc["Time"] <= "15:15")]
-                            exit_status = "3:15 Exit ✅"
-                            curr_s, curr_b = sell_entry, buy_entry
-
-                            for tm, tm_df in after_10.groupby("Time"):
-                                sr = tm_df[tm_df["STRIKE"] == sell_k]
-                                br = tm_df[tm_df["STRIKE"] == buy_k]
-                                if not sr.empty and not br.empty:
-                                    curr_s = float(sr[ltp_col].iloc[0])
-                                    curr_b = float(br[ltp_col].iloc[0])
-                                    mtm_rs = ((sell_entry - curr_s) + (curr_b - buy_entry)) * total_qty
-                                    if mtm_rs <= -total_sl_rs:
-                                        exit_status = f"SL Hit ❌ ({tm})"
-                                        break
-
-                            gross_rs = ((sell_entry - curr_s) + (curr_b - buy_entry)) * total_qty
-                            costs_rs = calc_roundtrip_charges(sell_entry, curr_s, buy_entry, curr_b, total_qty) if deduct_costs else 0.0
-                            net_rs = round(gross_rs - costs_rs, 0)
-                            net_pts = round(net_rs / total_qty, 1)
-
-                            trade_logs.append({
-                                "तारीख": str(dt),
-                                "DTE": f"{dte_val} DTE",
-                                "10:00 Spot": round(spot_1000, 1),
-                                trade_col_name: legs_text,
-                                "नतीजा": exit_status,
-                                "नेट पॉइंट्स": net_pts,
-                                "लाभ / हानि (₹)": net_rs
-                            })
-
-            else:
-                days_num = int(bt_days.split(" ")[0])
-                with st.spinner(f"Angel One SmartAPI से {days_num} दिनों का 1-मिनट असली स्पॉट डेटा लोड हो रहा है (बड़े डेटा में 10–25 सेकंड लग सकते हैं)..."):
-                    intraday = pd.DataFrame()
-                    if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
-                        intraday = fetch_angel_historical_spot(
-                            st.session_state["angel_jwt"], st.session_state["angel_key"], bt_idx, days_num
-                        )
-
-                    if intraday.empty:
-                        period_str = "30d" if days_num <= 30 else "60d"
-                        intraday = yf.download(bt_sym, period=period_str, interval="5m", progress=False)
-                        if isinstance(intraday.columns, pd.MultiIndex):
-                            intraday.columns = intraday.columns.get_level_values(0)
-                        if not intraday.empty:
-                            if intraday.index.tz is None:
-                                intraday.index = intraday.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-                            else:
-                                intraday.index = intraday.index.tz_convert('Asia/Kolkata')
-
-                    if intraday.empty:
-                        st.error("डेटा लोड नहीं हो पाया। कृपया Tab 2 में Angel One लॉगिन जांचें।")
-                    else:
-                        intraday['Date'] = intraday.index.date
-
-                        for dt, day_df in intraday.groupby('Date'):
-                            days_to_exp = (expiry_weekday - dt.weekday()) % 7
-                            if days_to_exp not in allowed_dte_nums:
-                                continue
-
-                            morning_session = day_df.between_time("09:15", "09:59")
-                            trade_session = day_df.between_time("10:00", "15:15")
-                            if len(morning_session) < 5 or len(trade_session) < 15:
-                                continue
-
-                            open_915 = float(morning_session['Open'].iloc[0])
-                            high_959 = float(morning_session['High'].max())
-                            low_959 = float(morning_session['Low'].min())
-                            spot_1000 = float(trade_session['Open'].iloc[0])
-                            atm_1000 = round(spot_1000 / step) * step
-
-                            morning_range_pct = max(0.0025, (high_959 - low_959) / spot_1000)
-                            daily_iv = min(0.32, max(base_iv * 0.85, morning_range_pct * 16.0))
-
-                            morning_move = spot_1000 - open_915
-                            is_bull_put = (morning_move >= 0)
-
-                            if is_bull_put:
-                                opt_type = "PE"
-                                sell_k = atm_1000
-                                buy_k = atm_1000 - hedge_points
-                                legs_text = f"Sell {sell_k} PE / Buy {buy_k} PE"
-                            else:
-                                opt_type = "CE"
-                                sell_k = atm_1000
-                                buy_k = atm_1000 + hedge_points
-                                legs_text = f"Sell {sell_k} CE / Buy {buy_k} CE"
-
-                            t_entry = (days_to_exp + (315.0 / 375.0)) / 365.0
-                            raw_sell_entry = bs_option_price(spot_1000, sell_k, t_entry, daily_iv, opt_type)
-                            raw_buy_entry = bs_option_price(spot_1000, buy_k, t_entry, daily_iv, opt_type)
-
-                            slip_mult = 1.0 if deduct_costs else 0.0
-                            sell_entry = round(raw_sell_entry - (max(0.5, raw_sell_entry * 0.004) * slip_mult), 2)
-                            buy_entry = round(raw_buy_entry + (max(0.5, raw_buy_entry * 0.012) * slip_mult), 2)
-
-                            exit_status = "3:15 Exit ✅"
-                            final_sell_exit = sell_entry
-                            final_buy_exit = buy_entry
-                            total_bars = len(trade_session)
-
-                            for idx_bar, (ts, row) in enumerate(trade_session.iterrows()):
-                                mins_left_today = max(15.0, 315.0 * (1.0 - (idx_bar / max(1, total_bars - 1))))
-                                t_curr = (days_to_exp + (mins_left_today / 375.0)) / 365.0
-
-                                worst_spot = float(row['Low']) if is_bull_put else float(row['High'])
-                                curr_sell = bs_option_price(worst_spot, sell_k, t_curr, daily_iv, opt_type)
-                                curr_buy = bs_option_price(worst_spot, buy_k, t_curr, daily_iv, opt_type)
-
-                                unrealized_rs = ((sell_entry - curr_sell) + (curr_buy - buy_entry)) * total_qty
-                                if unrealized_rs <= -total_sl_rs:
-                                    exit_status = f"SL Hit ❌ ({ts.strftime('%I:%M %p')})"
-                                    final_sell_exit = curr_sell + (max(0.5, curr_sell * 0.008) * slip_mult)
-                                    final_buy_exit = max(0.05, curr_buy - (max(0.5, curr_buy * 0.012) * slip_mult))
+                        for tm, tm_df in after_10.groupby("Time"):
+                            sr = tm_df[tm_df["STRIKE"] == sell_k]
+                            br = tm_df[tm_df["STRIKE"] == buy_k]
+                            if not sr.empty and not br.empty:
+                                curr_s = float(sr[ltp_col].iloc[0])
+                                curr_b = float(br[ltp_col].iloc[0])
+                                mtm_rs = ((sell_entry - curr_s) + (curr_b - buy_entry)) * total_qty
+                                if mtm_rs <= -total_sl_rs:
+                                    exit_status = f"SL Hit ❌ ({tm})"
                                     break
 
-                            if exit_status == "3:15 Exit ✅":
-                                close_spot = float(trade_session['Close'].iloc[-1])
-                                t_close = (days_to_exp + (15.0 / 375.0)) / 365.0
-                                c_sell = bs_option_price(close_spot, sell_k, t_close, daily_iv, opt_type)
-                                c_buy = bs_option_price(close_spot, buy_k, t_close, daily_iv, opt_type)
-                                final_sell_exit = c_sell + (max(0.5, c_sell * 0.004) * slip_mult)
-                                final_buy_exit = max(0.05, c_buy - (max(0.5, c_buy * 0.012) * slip_mult))
+                        gross_rs = ((sell_entry - curr_s) + (curr_b - buy_entry)) * total_qty
+                        costs_rs = calc_roundtrip_charges(sell_entry, curr_s, buy_entry, curr_b, total_qty) if deduct_costs else 0.0
+                        net_rs = round(gross_rs - costs_rs, 0)
+                        net_pts = round(net_rs / total_qty, 1)
 
-                            gross_pnl_rs = ((sell_entry - final_sell_exit) + (final_buy_exit - buy_entry)) * total_qty
-                            costs_rs = calc_roundtrip_charges(sell_entry, final_sell_exit, buy_entry, final_buy_exit, total_qty) if deduct_costs else 0.0
-                            day_pnl_rs = round(gross_pnl_rs - costs_rs, 0)
-                            day_pts = round(day_pnl_rs / total_qty, 1)
+                        trade_logs.append({
+                            "तारीख": str(dt),
+                            "10:00 Spot": round(spot_1000, 1),
+                            trade_col_name: legs_text,
+                            "नतीजा": exit_status,
+                            "नेट पॉइंट्स": net_pts,
+                            "लाभ / हानि (₹)": net_rs
+                        })
 
-                            trade_logs.append({
-                                "तारीख": str(dt),
-                                "DTE": f"{days_to_exp} DTE",
-                                "10:00 Spot": round(spot_1000, 1),
-                                trade_col_name: legs_text,
-                                "नतीजा": exit_status,
-                                "नेट पॉइंट्स": day_pts,
-                                "लाभ / हानि (₹)": day_pnl_rs
-                            })
+        else:
+            days_num = int(bt_days.split(" ")[0])
+            with st.spinner(f"Angel One SmartAPI से {days_num} दिनों का 1-मिनट असली स्पॉट डेटा लोड हो रहा है (बड़े डेटा में 10–25 सेकंड लग सकते हैं)..."):
+                intraday = pd.DataFrame()
+                if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
+                    intraday = fetch_angel_historical_spot(
+                        st.session_state["angel_jwt"], st.session_state["angel_key"], bt_idx, days_num
+                    )
 
-            res_df = pd.DataFrame(trade_logs)
-            if not res_df.empty:
-                res_df["कुल पूंजी बदलाव (₹)"] = res_df["लाभ / हानि (₹)"].cumsum()
-                total_pnl = res_df["लाभ / हानि (₹)"].sum()
-                win_days = len(res_df[res_df["लाभ / हानि (₹)"] > 0])
-                win_rate = round((win_days / len(res_df)) * 100, 1)
-                max_dd = round((res_df["कुल पूंजी बदलाव (₹)"].cummax() - res_df["कुल पूंजी बदलाव (₹)"]).max(), 0)
+                if intraday.empty:
+                    period_str = "30d" if days_num <= 30 else "60d"
+                    intraday = yf.download(bt_sym, period=period_str, interval="5m", progress=False)
+                    if isinstance(intraday.columns, pd.MultiIndex):
+                        intraday.columns = intraday.columns.get_level_values(0)
+                    if not intraday.empty:
+                        if intraday.index.tz is None:
+                            intraday.index = intraday.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+                        else:
+                            intraday.index = intraday.index.tz_convert('Asia/Kolkata')
 
-                r1, r2, r3, r4 = st.columns(4)
-                r1.metric("कुल शुद्ध लाभ / हानि", f"₹{total_pnl:,.0f}", f"{len(res_df)} ट्रेडिंग दिन")
-                r2.metric("Win Rate", f"{win_rate}%", f"{win_days} जीत / {len(res_df)-win_days} हार")
-                r3.metric("Max Drawdown", f"-₹{int(max_dd):,}", "अधिकतम गिरावट")
-                r4.metric("Stop-Loss", f"₹{int(total_sl_rs):,} / दिन", f"{hedge_points} pts Hedge")
+                if intraday.empty:
+                    st.error("डेटा लोड नहीं हो पाया। कृपया Tab 2 में Angel One लॉगिन जांचें।")
+                else:
+                    intraday['Date'] = intraday.index.date
 
-                # DTE के अनुसार अलग-अलग तुलना रिपोर्ट
-                st.markdown("### 📅 DTE के अनुसार परफॉर्मेंस तुलना (किस दिन कितना लाभ/हानि?)")
-                dte_summary_rows = []
-                for dte_lbl, grp in res_df.groupby("DTE"):
-                    t_cnt = len(grp)
-                    w_cnt = len(grp[grp["लाभ / हानि (₹)"] > 0])
-                    l_cnt = t_cnt - w_cnt
-                    w_pct = round((w_cnt / t_cnt) * 100, 1) if t_cnt > 0 else 0.0
-                    net_sum = round(grp["लाभ / हानि (₹)"].sum(), 0)
-                    avg_pnl = round(net_sum / t_cnt, 0) if t_cnt > 0 else 0.0
-                    dte_summary_rows.append({
-                        "DTE दिन": dte_lbl,
-                        "कुल ट्रेड": t_cnt,
-                        "जीत (Win)": w_cnt,
-                        "हार (SL)": l_cnt,
-                        "Win Rate (%)": f"{w_pct}%",
-                        "औसत लाभ/ट्रेड (₹)": avg_pnl,
-                        "कुल शुद्ध लाभ/हानि (₹)": net_sum
-                    })
-                st.dataframe(pd.DataFrame(dte_summary_rows), use_container_width=True, hide_index=True)
+                    for dt, day_df in intraday.groupby('Date'):
+                        morning_session = day_df.between_time("09:15", "09:59")
+                        trade_session = day_df.between_time("10:00", "15:15")
+                        if len(morning_session) < 5 or len(trade_session) < 15:
+                            continue
 
-                st.line_chart(res_df.set_index("तारीख")["कुल पूंजी बदलाव (₹)"])
-                st.dataframe(res_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("चुने गए DTE फ़िल्टर के लिए इस अवधि में कोई ट्रेड नहीं मिला।")
+                        open_915 = float(morning_session['Open'].iloc[0])
+                        high_959 = float(morning_session['High'].max())
+                        low_959 = float(morning_session['Low'].min())
+                        spot_1000 = float(trade_session['Open'].iloc[0])
+                        atm_1000 = round(spot_1000 / step) * step
+
+                        morning_range_pct = max(0.0025, (high_959 - low_959) / spot_1000)
+                        daily_iv = min(0.32, max(base_iv * 0.85, morning_range_pct * 16.0))
+
+                        days_to_exp = (expiry_weekday - dt.weekday()) % 7
+
+                        morning_move = spot_1000 - open_915
+                        is_bull_put = (morning_move >= 0)
+
+                        if is_bull_put:
+                            opt_type = "PE"
+                            sell_k = atm_1000
+                            buy_k = atm_1000 - hedge_points
+                            legs_text = f"Sell {sell_k} PE / Buy {buy_k} PE"
+                        else:
+                            opt_type = "CE"
+                            sell_k = atm_1000
+                            buy_k = atm_1000 + hedge_points
+                            legs_text = f"Sell {sell_k} CE / Buy {buy_k} CE"
+
+                        t_entry = (days_to_exp + (315.0 / 375.0)) / 365.0
+                        raw_sell_entry = bs_option_price(spot_1000, sell_k, t_entry, daily_iv, opt_type)
+                        raw_buy_entry = bs_option_price(spot_1000, buy_k, t_entry, daily_iv, opt_type)
+
+                        slip_mult = 1.0 if deduct_costs else 0.0
+                        sell_entry = round(raw_sell_entry - (max(0.5, raw_sell_entry * 0.004) * slip_mult), 2)
+                        buy_entry = round(raw_buy_entry + (max(0.5, raw_buy_entry * 0.012) * slip_mult), 2)
+
+                        exit_status = "3:15 Exit ✅"
+                        final_sell_exit = sell_entry
+                        final_buy_exit = buy_entry
+                        total_bars = len(trade_session)
+
+                        for idx_bar, (ts, row) in enumerate(trade_session.iterrows()):
+                            mins_left_today = max(15.0, 315.0 * (1.0 - (idx_bar / max(1, total_bars - 1))))
+                            t_curr = (days_to_exp + (mins_left_today / 375.0)) / 365.0
+
+                            worst_spot = float(row['Low']) if is_bull_put else float(row['High'])
+                            curr_sell = bs_option_price(worst_spot, sell_k, t_curr, daily_iv, opt_type)
+                            curr_buy = bs_option_price(worst_spot, buy_k, t_curr, daily_iv, opt_type)
+
+                            unrealized_rs = ((sell_entry - curr_sell) + (curr_buy - buy_entry)) * total_qty
+                            if unrealized_rs <= -total_sl_rs:
+                                exit_status = f"SL Hit ❌ ({ts.strftime('%I:%M %p')})"
+                                final_sell_exit = curr_sell + (max(0.5, curr_sell * 0.008) * slip_mult)
+                                final_buy_exit = max(0.05, curr_buy - (max(0.5, curr_buy * 0.012) * slip_mult))
+                                break
+
+                        if exit_status == "3:15 Exit ✅":
+                            close_spot = float(trade_session['Close'].iloc[-1])
+                            t_close = (days_to_exp + (15.0 / 375.0)) / 365.0
+                            c_sell = bs_option_price(close_spot, sell_k, t_close, daily_iv, opt_type)
+                            c_buy = bs_option_price(close_spot, buy_k, t_close, daily_iv, opt_type)
+                            final_sell_exit = c_sell + (max(0.5, c_sell * 0.004) * slip_mult)
+                            final_buy_exit = max(0.05, c_buy - (max(0.5, c_buy * 0.012) * slip_mult))
+
+                        gross_pnl_rs = ((sell_entry - final_sell_exit) + (final_buy_exit - buy_entry)) * total_qty
+                        costs_rs = calc_roundtrip_charges(sell_entry, final_sell_exit, buy_entry, final_buy_exit, total_qty) if deduct_costs else 0.0
+                        day_pnl_rs = round(gross_pnl_rs - costs_rs, 0)
+                        day_pts = round(day_pnl_rs / total_qty, 1)
+
+                        trade_logs.append({
+                            "तारीख": str(dt),
+                            "10:00 Spot": round(spot_1000, 1),
+                            trade_col_name: legs_text,
+                            "नतीजा": exit_status,
+                            "नेट पॉइंट्स": day_pts,
+                            "लाभ / हानि (₹)": day_pnl_rs
+                        })
+
+        res_df = pd.DataFrame(trade_logs)
+        if not res_df.empty:
+            res_df["कुल पूंजी बदलाव (₹)"] = res_df["लाभ / हानि (₹)"].cumsum()
+            total_pnl = res_df["लाभ / हानि (₹)"].sum()
+            win_days = len(res_df[res_df["लाभ / हानि (₹)"] > 0])
+            win_rate = round((win_days / len(res_df)) * 100, 1)
+            max_dd = round((res_df["कुल पूंजी बदलाव (₹)"].cummax() - res_df["कुल पूंजी बदलाव (₹)"]).max(), 0)
+
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("कुल शुद्ध लाभ / हानि", f"₹{total_pnl:,.0f}", f"{len(res_df)} ट्रेडिंग दिन")
+            r2.metric("Win Rate", f"{win_rate}%", f"{win_days} जीत / {len(res_df)-win_days} हार")
+            r3.metric("Max Drawdown", f"-₹{int(max_dd):,}", "अधिकतम गिरावट")
+            r4.metric("Stop-Loss", f"₹{int(total_sl_rs):,} / दिन", f"{hedge_points} pts Hedge")
+
+            st.line_chart(res_df.set_index("तारीख")["कुल पूंजी बदलाव (₹)"])
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
 
 # === END OF APP.PY ===
