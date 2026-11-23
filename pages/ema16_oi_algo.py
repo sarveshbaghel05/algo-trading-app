@@ -18,12 +18,12 @@ import pytz
 # पेज सेटिंग्स (सीधा खोलने पर भी सुरक्षित चले)
 # ==========================================
 try:
-    st.set_page_config(page_title="16 EMA + OI 40-Delta Algo (Pro Filters)", layout="wide")
+    st.set_page_config(page_title="16 EMA + OI 40-Delta Algo", layout="wide")
 except Exception:
     pass
 
 st.title("📈 16 EMA Pullback + ATM±3 OI एल्गो (40 Delta Spread)")
-st.caption("9:45–12:00 PM (दिन में 1 ट्रेड) | 3m/5m 16-EMA Slope + Fresh 2-3 Candle Breakout | ATM±3 OI (15% Buffer) | 40Δ Sell + Hedge | SL ₹1,700 | TSL +₹200 (@₹1,200) | OI Flip Exit | 2:59 PM")
+st.caption("सुबह 9:45 से 12:00 PM (दिन में 1 ट्रेड) | 3-Min / 5-Min 16 EMA टच + क्लोज कन्फर्म | 40 Delta Sell + Hedge | SL ₹1,700 | TSL +₹200 (@₹1,200) | OI Reversal Exit | 2:59 PM Square-Off")
 
 EMA_HISTORY_FILE = "ema16_oi_trades_history.csv"
 EMA_ACTIVE_FILE = "ema16_oi_active_trade.json"
@@ -245,7 +245,7 @@ def ema_place_order(jwt, api_key, exch, symbol, token, side_act, qty):
         "variety": "NORMAL", "tradingsymbol": symbol, "symboltoken": str(token),
         "transactiontype": side_act, "exchange": exch, "ordertype": "MARKET",
         "producttype": "INTRADAY", "duration": "DAY", "price": "0",
-        "squareoff": "0", "stoploss": "0", "quantity": str(quantity := qty)
+        "squareoff": "0", "stoploss": "0", "quantity": str(qty)
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=10).json()
@@ -278,7 +278,7 @@ def ema_get_live_ltp(jwt, api_key, exch, tokens_tup):
 @st.cache_data(ttl=60)
 def ema_fetch_intraday_candles(jwt, api_key, selected_idx, tf_mins, days_back=4):
     """
-    Angel One से 1 महीने से 5 साल तक का डेटा लाता है
+    Angel One से 30-30 दिन के टुकड़ों (chunks) में 1 महीने से 5 साल तक का डेटा लाता है
     और उसे 3-Min या 5-Min कैंडल + 16 EMA में बदलता है।
     """
     idx_map = {
@@ -567,9 +567,9 @@ def pick_40_delta_spread(direction, selected_idx, spot_price, full_df):
     return strat_name, summary, legs, round(sell_ltp - buy_ltp, 2)
 
 # ==========================================
-# उन्नत 16 EMA Pullback + 15% OI Buffer + Slope + Fresh 2-3 Candle Breakout इंजन
+# 16 EMA Pullback + Candle Close + ATM±3 Change in OI सिग्नल इंजन
 # ==========================================
-def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_mins, oi_buffer_pct=15.0):
+def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_mins):
     step = 50 if selected_idx == "Nifty 50" else 100
     atm = round(spot_price / step) * step
 
@@ -578,11 +578,9 @@ def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_
     call_chg_3 = int(up_3["CALL CHG OI"].sum()) if not up_3.empty else 0
     put_chg_3 = int(dn_3["PUT CHG OI"].sum()) if not dn_3.empty else 0
 
-    mult = 1.0 + (oi_buffer_pct / 100.0)
-    # 1) Minimum OI Buffer Filter: एक तरफ का Change in OI दूसरी तरफ से कम से कम 15% ज़्यादा हो
-    if put_chg_3 > 0 and put_chg_3 > max(call_chg_3 * mult, call_chg_3 + 10000):
+    if put_chg_3 > call_chg_3 and put_chg_3 > 0:
         oi_bias = "BULLISH"
-    elif call_chg_3 > 0 and call_chg_3 > max(put_chg_3 * mult, put_chg_3 + 10000):
+    elif call_chg_3 > put_chg_3 and call_chg_3 > 0:
         oi_bias = "BEARISH"
     else:
         oi_bias = "NEUTRAL"
@@ -596,34 +594,21 @@ def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_
             closed_df = closed_df.iloc[:-1]
 
     today_df = closed_df[closed_df.index.date == now_ist.date()]
-    if len(today_df) < 5:
+    if len(today_df) < 4:
         return {
             "signal": "WAIT",
             "oi_bias": oi_bias,
-            "ema_slope": "FLAT",
             "call_chg_3": call_chg_3,
             "put_chg_3": put_chg_3,
             "reason": "पर्याप्त बंद कैंडल्स का इंतज़ार हो रहा है...",
             "touch_info": None
         }
 
-    # 2) 16 EMA Slope Filter (झुकाव की जाँच — पिछली 3 कैंडल्स से तुलना)
-    ema_now = float(today_df["EMA16"].iloc[-1])
-    ema_prev3 = float(today_df["EMA16"].iloc[-4])
-    if ema_now > ema_prev3:
-        ema_slope = "UP ↗️"
-    elif ema_now < ema_prev3:
-        ema_slope = "DOWN ↘️"
-    else:
-        ema_slope = "FLAT ➡️"
-
     latest_bar = today_df.iloc[-1]
     latest_time = today_df.index[-1].strftime("%H:%M")
+    lookback = today_df.iloc[-6:-1]
 
-    # 3) Fresh 2-3 Candle Breakout Filter: टच होने के बाद केवल अगली 2 से 3 कैंडल्स के अंदर ही ब्रेकआउट मान्य
-    lookback = today_df.iloc[-4:-1]
-
-    if oi_bias == "BULLISH" and ema_now > ema_prev3:
+    if oi_bias == "BULLISH":
         for idx_t in range(len(lookback) - 1, -1, -1):
             t_bar = lookback.iloc[idx_t]
             t_time = lookback.index[idx_t].strftime("%H:%M")
@@ -632,14 +617,13 @@ def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_
                 return {
                     "signal": "BULLISH",
                     "oi_bias": oi_bias,
-                    "ema_slope": ema_slope,
                     "call_chg_3": call_chg_3,
                     "put_chg_3": put_chg_3,
-                    "reason": f"✅ BULLISH ENTRY! {t_time} कैंडल ने 16 EMA ({t_bar['EMA16']:.1f}) टच किया (High: {t_bar['High']:.1f}), और {latest_time} कैंडल ऊपर Close ({latest_bar['Close']:.1f}) हुई!",
+                    "reason": f"✅ BULLISH ENTRY! {t_time} कैंडल ने 16 EMA ({t_bar['EMA16']:.1f}) को टच किया (High: {t_bar['High']:.1f}), और {latest_time} कैंडल उसके ऊपर Close ({latest_bar['Close']:.1f}) हुई!",
                     "touch_info": {"touch_time": t_time, "touch_high": t_bar["High"], "close_px": latest_bar["Close"]}
                 }
 
-    if oi_bias == "BEARISH" and ema_now < ema_prev3:
+    if oi_bias == "BEARISH":
         for idx_t in range(len(lookback) - 1, -1, -1):
             t_bar = lookback.iloc[idx_t]
             t_time = lookback.index[idx_t].strftime("%H:%M")
@@ -648,20 +632,18 @@ def evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_
                 return {
                     "signal": "BEARISH",
                     "oi_bias": oi_bias,
-                    "ema_slope": ema_slope,
                     "call_chg_3": call_chg_3,
                     "put_chg_3": put_chg_3,
-                    "reason": f"🔴 BEARISH ENTRY! {t_time} कैंडल ने 16 EMA ({t_bar['EMA16']:.1f}) टच किया (Low: {t_bar['Low']:.1f}), और {latest_time} कैंडल नीचे Close ({latest_bar['Close']:.1f}) हुई!",
+                    "reason": f"🔴 BEARISH ENTRY! {t_time} कैंडल ने 16 EMA ({t_bar['EMA16']:.1f}) को टच किया (Low: {t_bar['Low']:.1f}), और {latest_time} कैंडल उसके नीचे Close ({latest_bar['Close']:.1f}) हुई!",
                     "touch_info": {"touch_time": t_time, "touch_low": t_bar["Low"], "close_px": latest_bar["Close"]}
                 }
 
     return {
         "signal": "WAIT",
         "oi_bias": oi_bias,
-        "ema_slope": ema_slope,
         "call_chg_3": call_chg_3,
         "put_chg_3": put_chg_3,
-        "reason": f"इंतज़ार: OI = {oi_bias} (15% Buffer) | 16 EMA Slope = {ema_slope} | ताज़ा टच + क्लोज़ की प्रतीक्षा है।",
+        "reason": f"इंतज़ार: OI दिशा = {oi_bias} | 16 EMA टच और ब्रेकआउट कैंडल क्लोज़ की प्रतीक्षा है।",
         "touch_info": None
     }
 
@@ -788,7 +770,7 @@ def ema_close_trade(curr_ltp_map, reason):
 # ==========================================
 # UI कंट्रोल्स और टैब्स
 # ==========================================
-tab_live, tab_bt = st.tabs(["🤖 Live / Paper ऑटो एल्गो + 16 EMA चार्ट", "📊 16 EMA + OI बैकटेस्ट (1M से 5Y + DTE)"])
+tab_live, tab_bt = st.tabs(["🤖 Live / Paper ऑटो एल्गो + 16 EMA चार्ट", "📊 16 EMA + OI बैकटेस्ट (1M से 5Y तक)"])
 
 with tab_live:
     c1, c2, c3, c4 = st.columns([2, 1.2, 1.2, 1])
@@ -866,9 +848,8 @@ with tab_live:
                 "DTE": [2.0] * len(strikes_t)
             })
 
-        setup = evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_m, oi_buffer_pct=15.0)
+        setup = evaluate_ema16_oi_setup(candle_df, spot_price, full_oc_df, selected_idx, tf_m)
         oi_bias = setup["oi_bias"]
-        ema_slope = setup.get("ema_slope", "FLAT")
         call_chg_3 = setup["call_chg_3"]
         put_chg_3 = setup["put_chg_3"]
 
@@ -900,7 +881,6 @@ with tab_live:
 
             cur_sl_rs = float(active_tr.get("sl_rs", -1700.0 * lots_tr))
             tr_dir = active_tr.get("direction", "BULLISH")
-            # केवल 15% OI Buffer पार करके विपरीत सिग्नल बनने पर ही रिवर्सल एग्जिट होगा
             oi_flipped = (tr_dir == "BULLISH" and oi_bias == "BEARISH") or (tr_dir == "BEARISH" and oi_bias == "BULLISH")
 
             if tg_cmd == "STATUS":
@@ -914,7 +894,7 @@ with tab_live:
                 ema_close_trade(curr_px_map, exit_lbl)
                 st.rerun()
             elif oi_flipped:
-                ema_close_trade(curr_px_map, f"ATM±3 OI Reversed ({tr_dir} ➔ {oi_bias}) 🔄")
+                ema_close_trade(curr_px_map, f"ATM±3 OI Signal Reversed ({tr_dir} ➔ {oi_bias}) 🔄")
                 st.rerun()
             elif curr_mins >= (14 * 60 + 59):
                 ema_close_trade(curr_px_map, "2:59 PM Auto Square-Off ⏰")
@@ -924,7 +904,7 @@ with tab_live:
             m1.metric("इंडेक्स & दिशा", f"{active_tr['index']} ({tr_dir})", active_tr["strategy"])
             m2.metric("लाइव MTM लाभ / हानि", f"₹{live_pnl_rs:+,.0f}", f"Qty: {active_tr['qty']}")
             m3.metric("सक्रिय Stop-Loss", f"₹{cur_sl_rs:+,.0f}", "TSL Locked 🔒" if active_tr.get("tsl_active") else "Initial SL (-₹1700/lot)")
-            m4.metric("ATM±3 OI (15% Buffer)", oi_bias, f"Put {put_chg_3:+,} | Call {call_chg_3:+,}")
+            m4.metric("ATM±3 OI स्थिति", oi_bias, f"Put {put_chg_3:+,} | Call {call_chg_3:+,}")
 
             lcols = st.columns(len(legs))
             for i, lg in enumerate(legs):
@@ -952,8 +932,8 @@ with tab_live:
 
             st.markdown(f"""
             <div style="background:{bg_c}; padding:16px 20px; border-radius:12px; border-left:6px solid {bd_c}; color:white; margin-bottom:12px;">
-                <div style="font-size:13px; color:#e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 🕯️ Timeframe: <b>{tf_m}-Min</b> | 16 EMA Slope: <b>{ema_slope}</b> | {win_badge}</div>
-                <div style="font-size:15px; margin-top:6px;">📊 <b>ATM±3 Change in OI (15% Buffer):</b> नीचे 3 Put Chg OI = <b>{put_chg_3:+,}</b> &nbsp;vs&nbsp; ऊपर 3 Call Chg OI = <b>{call_chg_3:+,}</b> &nbsp;➔&nbsp; <b>OI सिग्नल: {oi_bias}</b></div>
+                <div style="font-size:13px; color:#e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 🕯️ Timeframe: <b>{tf_m}-Min</b> | {win_badge}</div>
+                <div style="font-size:15px; margin-top:6px;">📊 <b>ATM±3 Change in OI:</b> नीचे 3 Put Chg OI = <b>{put_chg_3:+,}</b> &nbsp;vs&nbsp; ऊपर 3 Call Chg OI = <b>{call_chg_3:+,}</b> &nbsp;➔&nbsp; <b>OI सिग्नल: {oi_bias}</b></div>
                 <div style="font-size:17px; font-weight:bold; color:#fde047; margin:6px 0;">{setup['reason']}</div>
                 <div style="font-size:14px;">🎯 <b>40-Delta सेटअप ({preview_dir}):</b> {s_sum} &nbsp;|&nbsp; 🛡️ हेज: <b>{hedge_pts} pts</b> &nbsp;|&nbsp; नेट क्रेडिट: <b>₹{round(net_cr*lot_qty*lots_cnt):,}</b></div>
             </div>
@@ -1013,7 +993,7 @@ with tab_live:
     render_ema16_live(ema_mode, ema_idx, tf_mins, ema_lots, ema_live_ok, auto_arm)
 
 # ==========================================
-# TAB 2: 16 EMA + OI बैकटेस्टिंग इंजन (1M से 5Y + DTE Filter + Cost Toggle)
+# TAB 2: 16 EMA + OI बैकटेस्टिंग इंजन (1 महीना से 5 साल तक)
 # ==========================================
 with tab_bt:
     st.subheader("📊 16 EMA Pullback + ATM±3 OI + 40 Delta Spread बैकटेस्ट")
@@ -1040,15 +1020,7 @@ with tab_bt:
     with bc4:
         bt_lots = st.number_input("लॉट", min_value=1, max_value=25, value=1, key="ema_bt_lots")
 
-    dte_opts = ["0 DTE (Expiry Day)", "1 DTE", "2 DTE", "3 DTE", "4 DTE"]
-    sel_dtes = st.multiselect(
-        "📅 DTE फ़िल्टर (चुनें कि कौन-कौन से दिन ट्रेड करना है — 0 DTE = Expiry Day):",
-        options=dte_opts,
-        default=dte_opts,
-        key="ema_bt_dtes"
-    )
-    allowed_dtes = [int(x.split(" ")[0]) for x in sel_dtes]
-
+    # Brokerage, Slippage aur Tax ka alag button / mode selector
     cost_mode = st.radio(
         "💰 ब्रोकरेज, स्लिपेज और टैक्स सेटिंग (लगाकर या बिना लगाए चेक करें):",
         [
@@ -1061,196 +1033,171 @@ with tab_bt:
     apply_costs = cost_mode.startswith("✅")
 
     if st.button("🚀 16 EMA + OI बैकटेस्ट चलाएं (Run Backtest)", use_container_width=True):
-        if not allowed_dtes:
-            st.warning("⚠️ कृपया कम से कम एक DTE (जैसे 0 DTE या 1 DTE) जरूर चुनें!")
-        else:
-            tf_m_bt = 5 if "5" in bt_tf else 3
-            days_n = PERIOD_OPTIONS[bt_period_lbl]
-            jwt = st.session_state.get("angel_jwt", "")
-            akey = st.session_state.get("angel_key", "")
+        tf_m_bt = 5 if "5" in bt_tf else 3
+        days_n = PERIOD_OPTIONS[bt_period_lbl]
+        jwt = st.session_state.get("angel_jwt", "")
+        akey = st.session_state.get("angel_key", "")
 
-            with st.spinner(f"Angel One SmartAPI से {bt_period_lbl} के {tf_m_bt}-मिनट डेटा पर बैकटेस्ट चल रहा है..."):
-                df_c = ema_fetch_intraday_candles(jwt, akey, bt_idx, tf_m_bt, days_back=days_n)
-                if df_c.empty:
-                    st.error("डेटा लोड नहीं हो पाया। कृपया जांचें कि Angel One लॉगिन सक्रिय है।")
-                else:
-                    lot_qty = 75 if bt_idx == "Nifty 50" else 20
-                    step = 50 if bt_idx == "Nifty 50" else 100
-                    hedge_pts = 500 if bt_idx == "Nifty 50" else 1500
-                    expiry_wd = 3 if bt_idx == "Nifty 50" else 4
-                    total_qty = lot_qty * bt_lots
-                    iv_base = 0.14 if bt_idx == "Nifty 50" else 0.15
-                    slip_mult = 1.0 if apply_costs else 0.0
+        with st.spinner(f"Angel One SmartAPI से {bt_period_lbl} के {tf_m_bt}-मिनट डेटा पर बैकटेस्ट चल रहा है..."):
+            df_c = ema_fetch_intraday_candles(jwt, akey, bt_idx, tf_m_bt, days_back=days_n)
+            if df_c.empty:
+                st.error("डेटा लोड नहीं हो पाया। कृपया जांचें कि Angel One लॉगिन सक्रिय है।")
+            else:
+                lot_qty = 75 if bt_idx == "Nifty 50" else 20
+                step = 50 if bt_idx == "Nifty 50" else 100
+                hedge_pts = 500 if bt_idx == "Nifty 50" else 1500
+                expiry_wd = 3 if bt_idx == "Nifty 50" else 4
+                total_qty = lot_qty * bt_lots
+                iv_base = 0.14 if bt_idx == "Nifty 50" else 0.15
+                slip_mult = 1.0 if apply_costs else 0.0
 
-                    df_c["Date"] = df_c.index.date
-                    logs = []
+                df_c["Date"] = df_c.index.date
+                logs = []
 
-                    for dt, day_bars in df_c.groupby("Date"):
-                        days_to_exp = (expiry_wd - dt.weekday()) % 7
-                        if days_to_exp not in allowed_dtes:
+                for dt, day_bars in df_c.groupby("Date"):
+                    day_bars = day_bars.between_time("09:15", "14:59")
+                    if len(day_bars) < 8:
+                        continue
+
+                    open_915 = float(day_bars["Open"].iloc[0])
+                    days_to_exp = (expiry_wd - dt.weekday()) % 7
+                    t_base = (days_to_exp + 0.5) / 365.0
+
+                    for i in range(3, len(day_bars)):
+                        bar_ts = day_bars.index[i]
+                        mins_now = bar_ts.hour * 60 + bar_ts.minute
+                        if mins_now < (9 * 60 + 45) or mins_now > (12 * 60):
                             continue
 
-                        day_bars = day_bars.between_time("09:15", "14:59")
-                        if len(day_bars) < 8:
-                            continue
+                        cur_bar = day_bars.iloc[i]
+                        prev_bars = day_bars.iloc[max(0, i-4):i]
 
-                        open_915 = float(day_bars["Open"].iloc[0])
-                        t_base = (days_to_exp + 0.5) / 365.0
+                        day_chg_pct = ((cur_bar["Close"] - open_915) / open_915) * 100.0
+                        oi_dir = "BULLISH" if day_chg_pct >= 0.12 else ("BEARISH" if day_chg_pct <= -0.12 else "NEUTRAL")
 
-                        for i in range(4, len(day_bars)):
-                            bar_ts = day_bars.index[i]
-                            mins_now = bar_ts.hour * 60 + bar_ts.minute
-                            if mins_now < (9 * 60 + 45) or mins_now > (12 * 60):
-                                continue
+                        matched_dir = None
+                        if oi_dir == "BULLISH":
+                            for j in range(len(prev_bars)-1, -1, -1):
+                                tb = prev_bars.iloc[j]
+                                if tb["Low"] <= tb["EMA16"] and tb["High"] > tb["EMA16"] and cur_bar["Close"] > tb["High"]:
+                                    matched_dir = "BULLISH"
+                                    break
+                        elif oi_dir == "BEARISH":
+                            for j in range(len(prev_bars)-1, -1, -1):
+                                tb = prev_bars.iloc[j]
+                                if tb["High"] >= tb["EMA16"] and tb["Low"] < tb["EMA16"] and cur_bar["Close"] < tb["Low"]:
+                                    matched_dir = "BEARISH"
+                                    break
 
-                            cur_bar = day_bars.iloc[i]
-                            # 16 EMA Slope Check (पिछली 3 कैंडल्स से तुलना)
-                            ema_now = float(cur_bar["EMA16"])
-                            ema_p3 = float(day_bars["EMA16"].iloc[i-3])
+                        if matched_dir:
+                            spot_ent = float(cur_bar["Close"])
+                            side = "PE" if matched_dir == "BULLISH" else "CE"
 
-                            # केवल 2-3 कैंडल पुराना ताज़ा टच ही मान्य (Fresh Touch Filter)
-                            prev_bars = day_bars.iloc[max(0, i-3):i]
+                            best_k = round(spot_ent / step) * step
+                            best_d = 999.0
+                            for off in range(-6, 7):
+                                cand_k = best_k + off * step
+                                if side == "PE" and cand_k > spot_ent + step:
+                                    continue
+                                if side == "CE" and cand_k < spot_ent - step:
+                                    continue
+                                dv = abs(calc_bs_delta(spot_ent, cand_k, t_base, iv_base, side))
+                                if abs(dv - 0.40) < best_d:
+                                    best_d = abs(dv - 0.40)
+                                    best_k = cand_k
 
-                            # Minimum OI Buffer (कम से कम 0.18% स्पष्ट दिशा हो तभी OI सिग्नल मान्य)
-                            day_chg_pct = ((cur_bar["Close"] - open_915) / open_915) * 100.0
-                            oi_dir = "BULLISH" if day_chg_pct >= 0.18 else ("BEARISH" if day_chg_pct <= -0.18 else "NEUTRAL")
+                            hedge_k = (best_k - hedge_pts) if side == "PE" else (best_k + hedge_pts)
+                            raw_sell_ent = calc_bs_price(spot_ent, best_k, t_base, iv_base, side)
+                            raw_buy_ent = calc_bs_price(spot_ent, hedge_k, t_base, iv_base, side)
 
-                            matched_dir = None
-                            if oi_dir == "BULLISH" and ema_now > ema_p3:
-                                for j in range(len(prev_bars)-1, -1, -1):
-                                    tb = prev_bars.iloc[j]
-                                    if tb["Low"] <= tb["EMA16"] and tb["High"] > tb["EMA16"] and cur_bar["Close"] > tb["High"]:
-                                        matched_dir = "BULLISH"
-                                        break
-                            elif oi_dir == "BEARISH" and ema_now < ema_p3:
-                                for j in range(len(prev_bars)-1, -1, -1):
-                                    tb = prev_bars.iloc[j]
-                                    if tb["High"] >= tb["EMA16"] and tb["Low"] < tb["EMA16"] and cur_bar["Close"] < tb["Low"]:
-                                        matched_dir = "BEARISH"
-                                        break
+                            # Slippage lagane par sell thoda niche aur buy thoda upar fill hota hai
+                            sell_ent = max(0.5, raw_sell_ent - (max(0.35, raw_sell_ent * 0.004) * slip_mult))
+                            buy_ent = raw_buy_ent + (max(0.35, raw_buy_ent * 0.01) * slip_mult)
 
-                            if matched_dir:
-                                spot_ent = float(cur_bar["Close"])
-                                side = "PE" if matched_dir == "BULLISH" else "CE"
+                            sl_limit = -1700.0 * bt_lots
+                            tsl_locked = False
+                            exit_reason = "2:59 PM Exit ⏰"
+                            s_exit = sell_ent
+                            b_exit = buy_ent
 
-                                best_k = round(spot_ent / step) * step
-                                best_d = 999.0
-                                for off in range(-6, 7):
-                                    cand_k = best_k + off * step
-                                    if side == "PE" and cand_k > spot_ent + step:
-                                        continue
-                                    if side == "CE" and cand_k < spot_ent - step:
-                                        continue
-                                    dv = abs(calc_bs_delta(spot_ent, cand_k, t_base, iv_base, side))
-                                    if abs(dv - 0.40) < best_d:
-                                        best_d = abs(dv - 0.40)
-                                        best_k = cand_k
+                            rem_bars = day_bars.iloc[i+1:]
+                            total_rem = max(1, len(rem_bars))
+                            for step_idx, (ex_ts, ex_bar) in enumerate(rem_bars.iterrows()):
+                                decay_frac = max(0.05, 1.0 - (0.35 * (step_idx / total_rem)))
+                                t_now = t_base * decay_frac
+                                sp_now = float(ex_bar["Close"])
 
-                                hedge_k = (best_k - hedge_pts) if side == "PE" else (best_k + hedge_pts)
-                                raw_sell_ent = calc_bs_price(spot_ent, best_k, t_base, iv_base, side)
-                                raw_buy_ent = calc_bs_price(spot_ent, hedge_k, t_base, iv_base, side)
+                                s_now = calc_bs_price(sp_now, best_k, t_now, iv_base, side)
+                                b_now = calc_bs_price(sp_now, hedge_k, t_now, iv_base, side)
+                                mtm_rs = ((sell_ent - s_now) + (b_now - buy_ent)) * total_qty
 
-                                sell_ent = max(0.5, raw_sell_ent - (max(0.35, raw_sell_ent * 0.004) * slip_mult))
-                                buy_ent = raw_buy_ent + (max(0.35, raw_buy_ent * 0.01) * slip_mult)
+                                if not tsl_locked and mtm_rs >= (1200.0 * bt_lots):
+                                    tsl_locked = True
+                                    sl_limit = 200.0 * bt_lots
 
-                                sl_limit = -1700.0 * bt_lots
-                                tsl_locked = False
-                                exit_reason = "2:59 PM Exit ⏰"
-                                s_exit = sell_ent
-                                b_exit = buy_ent
+                                flip_pct = ((sp_now - open_915) / open_915) * 100.0
+                                new_oi = "BULLISH" if flip_pct >= 0.12 else ("BEARISH" if flip_pct <= -0.12 else "NEUTRAL")
+                                oi_flip = (matched_dir == "BULLISH" and new_oi == "BEARISH") or (matched_dir == "BEARISH" and new_oi == "BULLISH")
 
-                                rem_bars = day_bars.iloc[i+1:]
-                                total_rem = max(1, len(rem_bars))
-                                for step_idx, (ex_ts, ex_bar) in enumerate(rem_bars.iterrows()):
-                                    decay_frac = max(0.05, 1.0 - (0.35 * (step_idx / total_rem)))
-                                    t_now = t_base * decay_frac
-                                    sp_now = float(ex_bar["Close"])
+                                s_exit, b_exit = s_now, b_now
+                                if mtm_rs <= sl_limit:
+                                    exit_reason = f"TSL Hit (+₹{int(sl_limit):,}) 🔒" if tsl_locked else f"SL Hit (-₹{int(abs(sl_limit)):,}) 🛑"
+                                    break
+                                elif oi_flip:
+                                    exit_reason = "OI Signal Reversed 🔄"
+                                    break
 
-                                    s_now = calc_bs_price(sp_now, best_k, t_now, iv_base, side)
-                                    b_now = calc_bs_price(sp_now, hedge_k, t_now, iv_base, side)
-                                    mtm_rs = ((sell_ent - s_now) + (b_now - buy_ent)) * total_qty
+                            # Exit par bhi slippage (agar ON hai toh)
+                            s_exit_final = s_exit + (max(0.35, s_exit * 0.004) * slip_mult)
+                            b_exit_final = max(0.05, b_exit - (max(0.35, b_exit * 0.01) * slip_mult))
 
-                                    if not tsl_locked and mtm_rs >= (1200.0 * bt_lots):
-                                        tsl_locked = True
-                                        sl_limit = 200.0 * bt_lots
+                            gross_rs = round(((raw_sell_ent - s_exit) + (b_exit - raw_buy_ent)) * total_qty, 0)
+                            after_slip_rs = ((sell_ent - s_exit_final) + (b_exit_final - buy_ent)) * total_qty
 
-                                    flip_pct = ((sp_now - open_915) / open_915) * 100.0
-                                    new_oi = "BULLISH" if flip_pct >= 0.18 else ("BEARISH" if flip_pct <= -0.18 else "NEUTRAL")
-                                    oi_flip = (matched_dir == "BULLISH" and new_oi == "BEARISH") or (matched_dir == "BEARISH" and new_oi == "BULLISH")
+                            if apply_costs:
+                                sell_to = (sell_ent + b_exit_final) * total_qty
+                                buy_to = (s_exit_final + buy_ent) * total_qty
+                                brok_tax = calc_spread_charges(sell_to, buy_to)
+                                slip_rs = round(gross_rs - after_slip_rs, 0)
+                                total_cost_rs = round(brok_tax + slip_rs, 0)
+                                net_rs = round(after_slip_rs - brok_tax, 0)
+                            else:
+                                total_cost_rs = 0.0
+                                net_rs = gross_rs
 
-                                    s_exit, b_exit = s_now, b_now
-                                    if mtm_rs <= sl_limit:
-                                        exit_reason = f"TSL Hit (+₹{int(sl_limit):,}) 🔒" if tsl_locked else f"SL Hit (-₹{int(abs(sl_limit)):,}) 🛑"
-                                        break
-                                    elif oi_flip:
-                                        exit_reason = "OI Signal Reversed 🔄"
-                                        break
-
-                                s_exit_final = s_exit + (max(0.35, s_exit * 0.004) * slip_mult)
-                                b_exit_final = max(0.05, b_exit - (max(0.35, b_exit * 0.01) * slip_mult))
-
-                                gross_rs = round(((raw_sell_ent - s_exit) + (b_exit - raw_buy_ent)) * total_qty, 0)
-                                after_slip_rs = ((sell_ent - s_exit_final) + (b_exit_final - buy_ent)) * total_qty
-
-                                if apply_costs:
-                                    sell_to = (sell_ent + b_exit_final) * total_qty
-                                    buy_to = (s_exit_final + buy_ent) * total_qty
-                                    brok_tax = calc_spread_charges(sell_to, buy_to)
-                                    slip_rs = round(gross_rs - after_slip_rs, 0)
-                                    total_cost_rs = round(brok_tax + slip_rs, 0)
-                                    net_rs = round(after_slip_rs - brok_tax, 0)
-                                else:
-                                    total_cost_rs = 0.0
-                                    net_rs = gross_rs
-
-                                logs.append({
-                                    "तारीख": str(dt),
-                                    "DTE": f"{days_to_exp} DTE",
-                                    "एंट्री समय": bar_ts.strftime("%H:%M"),
-                                    "दिशा": matched_dir,
-                                    "स्प्रेड": f"Sell {best_k} {side} / Buy {hedge_k} {side}",
-                                    "नतीजा": exit_reason,
-                                    "Gross P&L (₹)": gross_rs,
-                                    "खर्च (Brok+Tax+Slip)": total_cost_rs,
-                                    "Final P&L (₹)": net_rs
-                                })
-                                break
-
-                    if logs:
-                        res_df = pd.DataFrame(logs)
-                        res_df["कुल पूंजी (₹)"] = res_df["Final P&L (₹)"].cumsum()
-                        tot_gross = res_df["Gross P&L (₹)"].sum()
-                        tot_cost = res_df["खर्च (Brok+Tax+Slip)"].sum()
-                        tot_pnl = res_df["Final P&L (₹)"].sum()
-                        wins = len(res_df[res_df["Final P&L (₹)"] > 0])
-                        wr = round((wins / len(res_df)) * 100, 1)
-                        max_dd = round((res_df["कुल पूंजी (₹)"].cummax() - res_df["कुल पूंजी (₹)"]).max(), 0)
-
-                        badge_txt = "Brokerage + Slippage + Tax सहित (Net)" if apply_costs else "Bina Brokerage/Tax/Slippage (Raw Gross)"
-                        st.caption(f"📌 **रिपोर्ट मोड:** `{badge_txt}`")
-
-                        m1, m2, m3, m4, m5 = st.columns(5)
-                        m1.metric("Final P&L", f"₹{tot_pnl:+,.0f}", f"{len(res_df)} ट्रेड ({bt_period_lbl})")
-                        m2.metric("Gross P&L (बिना खर्च)", f"₹{tot_gross:+,.0f}", f"{tf_m_bt}-Min | 40Δ")
-                        m3.metric("कुल खर्च (Brok+Tax+Slip)", f"-₹{int(tot_cost):,}", "ON ✅" if apply_costs else "OFF 🚫")
-                        m4.metric("Win Rate", f"{wr}%", f"{wins} जीत / {len(res_df)-wins} हार")
-                        m5.metric("Max Drawdown", f"-₹{int(max_dd):,}", f"+{hedge_pts}pt Hedge")
-
-                        st.markdown("### 📅 DTE के अनुसार परफॉर्मेंस (0 DTE vs Non-Expiry Days)")
-                        dte_summary = []
-                        for d_lbl, grp in res_df.groupby("DTE"):
-                            tc = len(grp)
-                            wc = len(grp[grp["Final P&L (₹)"] > 0])
-                            dte_summary.append({
-                                "DTE": d_lbl,
-                                "कुल ट्रेड": tc,
-                                "जीत": wc,
-                                "Win %": f"{round((wc/tc)*100, 1)}%",
-                                "Final P&L (₹)": round(grp["Final P&L (₹)"].sum(), 0)
+                            logs.append({
+                                "तारीख": str(dt),
+                                "एंट्री समय": bar_ts.strftime("%H:%M"),
+                                "दिशा": matched_dir,
+                                "स्प्रेड": f"Sell {best_k} {side} / Buy {hedge_k} {side}",
+                                "नतीजा": exit_reason,
+                                "Gross P&L (₹)": gross_rs,
+                                "खर्च (Brok+Tax+Slip)": total_cost_rs,
+                                "Final P&L (₹)": net_rs
                             })
-                        st.dataframe(pd.DataFrame(dte_summary), use_container_width=True, hide_index=True)
+                            break
 
-                        st.line_chart(res_df.set_index("तारीख")["कुल पूंजी (₹)"])
-                        st.dataframe(res_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("चुने गए DTE फ़िल्टर और अवधि में कोई 16 EMA + OI सेटअप नहीं मिला।")
+                if logs:
+                    res_df = pd.DataFrame(logs)
+                    res_df["कुल पूंजी (₹)"] = res_df["Final P&L (₹)"].cumsum()
+                    tot_gross = res_df["Gross P&L (₹)"].sum()
+                    tot_cost = res_df["खर्च (Brok+Tax+Slip)"].sum()
+                    tot_pnl = res_df["Final P&L (₹)"].sum()
+                    wins = len(res_df[res_df["Final P&L (₹)"] > 0])
+                    wr = round((wins / len(res_df)) * 100, 1)
+                    max_dd = round((res_df["कुल पूंजी (₹)"].cummax() - res_df["कुल पूंजी (₹)"]).max(), 0)
+
+                    badge_txt = "Brokerage + Slippage + Tax सहित (Net)" if apply_costs else "Bina Brokerage/Tax/Slippage (Raw Gross)"
+                    st.caption(f"📌 **रिपोर्ट मोड:** `{badge_txt}`")
+
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Final P&L", f"₹{tot_pnl:+,.0f}", f"{len(res_df)} ट्रेड ({bt_period_lbl})")
+                    m2.metric("Gross P&L (बिना खर्च)", f"₹{tot_gross:+,.0f}", f"{tf_m_bt}-Min | 40Δ")
+                    m3.metric("कुल खर्च (Brok+Tax+Slip)", f"-₹{int(tot_cost):,}", "ON ✅" if apply_costs else "OFF 🚫")
+                    m4.metric("Win Rate", f"{wr}%", f"{wins} जीत / {len(res_df)-wins} हार")
+                    m5.metric("Max Drawdown", f"-₹{int(max_dd):,}", f"+{hedge_pts}pt Hedge")
+
+                    st.line_chart(res_df.set_index("तारीख")["कुल पूंजी (₹)"])
+                    st.dataframe(res_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("चुनी गई अवधि में 9:45 से 12:00 के बीच कोई 16 EMA + OI सेटअप नहीं मिला।")
