@@ -12,10 +12,28 @@ from io import StringIO
 from datetime import datetime, timedelta
 import pytz
 
-try:
-    from pages.greek_regime_indicator import evaluate_greeks_regime
-except ImportError:
-    from pages.greeks_regime_indicator import evaluate_greeks_regime
+evaluate_greeks_regime = None
+for _mod_name in ["pages.greek_regime_indicator", "greek_regime_indicator", "pages.greeks_regime_indicator", "greeks_regime_indicator"]:
+    try:
+        _mod = __import__(_mod_name, fromlist=["evaluate_greeks_regime"])
+        evaluate_greeks_regime = getattr(_mod, "evaluate_greeks_regime")
+        break
+    except Exception:
+        continue
+
+if evaluate_greeks_regime is None:
+    def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Live"):
+        step = 50 if selected_idx == "Nifty 50" else 100
+        atm = round(spot_price / step) * step
+        up_df = full_df[(full_df["STRIKE"] > atm) & (full_df["STRIKE"] <= atm + 3 * step)]
+        dn_df = full_df[(full_df["STRIKE"] < atm) & (full_df["STRIKE"] >= atm - 3 * step)]
+        up_ce = int(up_df["CALL CHG OI"].sum()) if not up_df.empty else 0
+        dn_pe = int(dn_df["PUT CHG OI"].sum()) if not dn_df.empty else 0
+        if dn_pe > up_ce * 1.25 and dn_pe > 0:
+            return {"direction": "UP", "gamma_iv_risk": 40.0, "gamma_iv_score": 40.0}
+        elif up_ce > dn_pe * 1.25 and up_ce > 0:
+            return {"direction": "DOWN", "gamma_iv_risk": 40.0, "gamma_iv_score": 40.0}
+        return {"direction": "SIDEWAYS", "gamma_iv_risk": 35.0, "gamma_iv_score": 35.0}
 
 st.title("🧠 Smart 4-Layer Pro Algo Terminal")
 st.caption("0.25 Delta OTM स्ट्राइक | Leg-wise 35% SL | VWAP + ORB + 3-Strike OI कन्फर्मेशन | Zero Fake Data")
@@ -25,7 +43,7 @@ PRO_ACTIVE_FILE = "pro_active_trade.json"
 DEFAULT_GH_REPO = "Sarveshbaghel05/algo-trading-app"
 
 # ==========================================
-# 1. GitHub Permanent Storage (अलग फ़ाइलें)
+# 1. GitHub Permanent Storage
 # ==========================================
 def _gh_cfg():
     try:
@@ -98,6 +116,25 @@ def load_pro_active():
 def save_pro_active(tr):
     gh_write(PRO_ACTIVE_FILE, json.dumps(tr if tr else {}, ensure_ascii=False), "Update Pro Algo active trade")
 
+def load_shared_base_oi():
+    ist = pytz.timezone("Asia/Kolkata")
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+    if st.session_state.get("shared_base_oi_date") != today_str:
+        st.session_state["shared_base_oi_date"] = today_str
+        st.session_state["shared_base_oi_map"] = {}
+        raw, _ = gh_read("daily_base_oi.json")
+        if raw:
+            try:
+                data = json.loads(raw)
+                if data.get("date") == today_str and isinstance(data.get("oi_map"), dict):
+                    st.session_state["shared_base_oi_map"] = {str(k): int(v) for k, v in data["oi_map"].items()}
+            except Exception:
+                pass
+    return st.session_state["shared_base_oi_map"], today_str
+
+def save_shared_base_oi(oi_map, today_str):
+    gh_write("daily_base_oi.json", json.dumps({"date": today_str, "oi_map": oi_map}), f"Save daily base OI {today_str}")
+
 # ==========================================
 # 2. Session State
 # ==========================================
@@ -154,7 +191,7 @@ def pro_tg_cmd():
         return None
 
 # ==========================================
-# 4. Angel One SmartAPI (बिना नकली डेटा के)
+# 4. Angel One SmartAPI
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_scrip_master():
@@ -259,8 +296,7 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
     return {"ok": False}
 
 @st.cache_data(ttl=8)
-def fetch_live_chain_strict(jwt, akey, selected_idx):
-    """केवल असली Angel One ऑप्शन चेन डेटा (कोई Random Fallback नहीं)"""
+def _fetch_live_chain_raw(jwt, akey, selected_idx):
     idx_info = {
         "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50, "hedge": 500, "lot": 75},
         "Bank Nifty": {"exch": "NSE", "token": "99926009", "name": "BANKNIFTY", "opt_exch": "NFO", "step": 100, "hedge": 1000, "lot": 30},
@@ -333,24 +369,60 @@ def fetch_live_chain_strict(jwt, akey, selected_idx):
 
     rows = []
     for k in sorted(sub["clean_strike"].unique()):
-        ce_q = fetched.get(cmap.get((k, "CE"), {}).get("token", ""), {})
-        pe_q = fetched.get(cmap.get((k, "PE"), {}).get("token", ""), {})
+        ce_tok = cmap.get((k, "CE"), {}).get("token", "")
+        pe_tok = cmap.get((k, "PE"), {}).get("token", "")
+        ce_q = fetched.get(ce_tok, {})
+        pe_q = fetched.get(pe_tok, {})
         rows.append({
+            "CE_TOKEN": ce_tok,
+            "PE_TOKEN": pe_tok,
             "STRIKE": k,
             "CALL VOL": int(float(ce_q.get("tradeVolume", 0) or 0)),
-            "CALL CHG OI": int(float(ce_q.get("netChangeOpnInterest", 0) or 0)),
             "CALL OI": int(float(ce_q.get("opnInterest", 0) or 0)),
             "CALL LTP": float(ce_q.get("ltp", 0.0) or 0.0),
             "PUT LTP": float(pe_q.get("ltp", 0.0) or 0.0),
             "PUT OI": int(float(pe_q.get("opnInterest", 0) or 0)),
-            "PUT CHG OI": int(float(pe_q.get("netChangeOpnInterest", 0) or 0)),
             "PUT VOL": int(float(pe_q.get("tradeVolume", 0) or 0)),
         })
 
     return {
-        "df": pd.DataFrame(rows), "spot": spot, "atm": atm, "exp_str": exp_str,
+        "raw_df": pd.DataFrame(rows), "spot": spot, "atm": atm, "exp_str": exp_str,
         "dte": dte, "cmap": cmap, "info": idx_info
     }, None
+
+def fetch_live_chain_strict(jwt, akey, selected_idx):
+    """केवल असली Angel One ऑप्शन चेन डेटा + सटीक Base-OI Change कैलकुलेशन"""
+    data, err = _fetch_live_chain_raw(jwt, akey, selected_idx)
+    if err or not data:
+        return data, err
+
+    base_map, today_str = load_shared_base_oi()
+    updated_base = False
+    df = data["raw_df"].copy()
+    ce_chgs, pe_chgs = [], []
+
+    for _, r in df.iterrows():
+        c_tok, p_tok = r["CE_TOKEN"], r["PE_TOKEN"]
+        c_oi, p_oi = int(r["CALL OI"]), int(r["PUT OI"])
+
+        if c_tok and c_oi > 0 and c_tok not in base_map:
+            base_map[c_tok] = c_oi
+            updated_base = True
+        if p_tok and p_oi > 0 and p_tok not in base_map:
+            base_map[p_tok] = p_oi
+            updated_base = True
+
+        ce_chgs.append((c_oi - base_map[c_tok]) if (c_tok in base_map and c_oi > 0) else 0)
+        pe_chgs.append((p_oi - base_map[p_tok]) if (p_tok in base_map and p_oi > 0) else 0)
+
+    if updated_base:
+        st.session_state["shared_base_oi_map"] = base_map
+        save_shared_base_oi(base_map, today_str)
+
+    df["CALL CHG OI"] = ce_chgs
+    df["PUT CHG OI"] = pe_chgs
+    data["df"] = df[["STRIKE", "CALL VOL", "CALL CHG OI", "CALL OI", "CALL LTP", "PUT LTP", "PUT OI", "PUT CHG OI", "PUT VOL"]]
+    return data, None
 
 # ==========================================
 # 5. मेरा 4-Layer Decision Engine
@@ -363,7 +435,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
 
     morning_move_pct = abs((spot - orb_data["open"]) / orb_data["open"]) * 100.0 if orb_data.get("ok") else 0.0
     orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.4
-    gamma_iv = float(g_info.get("gamma_iv_score", 40))
+    gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 40)))
 
     if morning_move_pct >= 1.0:
         return {"decision": "NO_TRADE", "score": "0/3", "reason": f"सुबह पहले ही {morning_move_pct:.2f}% बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"}
@@ -391,19 +463,19 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     else:
         details.append("⚠️ L1 (Price): ORB डेटा प्रतीक्षारत")
 
-    up3 = df[(df["STRIKE"] > atm) & (df["STRIKE"] <= atm + 3 * step)]["CALL CHG OI"].sum()
-    dn3 = df[(df["STRIKE"] < atm) & (df["STRIKE"] >= atm - 3 * step)]["PUT CHG OI"].sum()
+    up3 = int(df[(df["STRIKE"] > atm) & (df["STRIKE"] <= atm + 3 * step)]["CALL CHG OI"].sum())
+    dn3 = int(df[(df["STRIKE"] < atm) & (df["STRIKE"] >= atm - 3 * step)]["PUT CHG OI"].sum())
     if dn3 > 0 and dn3 >= up3 * 1.30:
         votes_up += 1
-        details.append(f"✅ L2 (OI): Put Chg OI ({int(dn3):,}) > Call ({int(up3):,}) +30% (Bullish)")
+        details.append(f"✅ L2 (OI): Put Chg OI ({dn3:+,}) > Call ({up3:+,}) +30% (Bullish)")
     elif up3 > 0 and up3 >= dn3 * 1.30:
         votes_down += 1
-        details.append(f"✅ L2 (OI): Call Chg OI ({int(up3):,}) > Put ({int(dn3):,}) +30% (Bearish)")
-    elif up3 > 0 and dn3 > 0 and abs(up3 - dn3) <= max(up3, dn3) * 0.20:
+        details.append(f"✅ L2 (OI): Call Chg OI ({up3:+,}) > Put ({dn3:+,}) +30% (Bearish)")
+    elif (up3 != 0 or dn3 != 0) and abs(up3 - dn3) <= max(abs(up3), abs(dn3)) * 0.25:
         votes_side += 1
-        details.append("✅ L2 (OI): दोनों ओर बराबर Call व Put राइटिंग (Sideways)")
+        details.append(f"✅ L2 (OI): दोनों ओर बराबर Call ({up3:+,}) व Put ({dn3:+,}) राइटिंग (Sideways)")
     else:
-        details.append(f"⚠️ L2 (OI): OI डेटा में टकराव (Call: {int(up3):,} vs Put: {int(dn3):,})")
+        details.append(f"⚠️ L2 (OI): OI डेटा में टकराव या शुरुआती सत्र (Call: {up3:+,} vs Put: {dn3:+,})")
 
     g_dir = g_info.get("direction", "SIDEWAYS")
     if g_dir == "UP":
