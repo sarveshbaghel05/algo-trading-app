@@ -912,7 +912,7 @@ with tab1:
         tg_cmd = check_telegram_commands()
 
         if selected_idx == "Nifty 50":
-            sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 500, 75
+            sym, step, default_spot, hedge_pts, lot_qty = "^NSEI", 50, 24000.0, 500, 65
         elif selected_idx == "Bank Nifty":
             sym, step, default_spot, hedge_pts, lot_qty = "^NSEBANK", 100, 51000.0, 1000, 30
         else:
@@ -1331,7 +1331,7 @@ with tab3:
             st.warning("⚠️ कृपया कम से कम एक DTE (जैसे 0 DTE या 1 DTE) जरूर चुनें!")
         else:
             if bt_idx == "Nifty 50":
-                bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 75, 500, 3, 0.135
+                bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEI", 50, 65, 500, 3, 0.135
             elif bt_idx == "Bank Nifty":
                 bt_sym, step, lot_qty, hedge_points, expiry_weekday, base_iv = "^NSEBANK", 100, 30, 1000, 2, 0.165
             else:
