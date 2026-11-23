@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Options Simulator", layout="wide")
 
 INDEX_CONFIG = {
-    "NIFTY": {"lot": 75, "step": 50, "base_spot": 24250},
+    "NIFTY": {"lot": 65, "step": 50, "base_spot": 24250},
     "BANKNIFTY": {"lot": 30, "step": 100, "base_spot": 51800},
     "SENSEX": {"lot": 20, "step": 100, "base_spot": 79800},
 }
