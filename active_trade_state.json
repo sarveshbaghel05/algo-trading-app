@@ -1,1 +1,1 @@
-{}
+{"mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)", "index": "Nifty 50", "strategy": "Bear Call Spread (मंदी का ट्रेड)", "summary": "Sell 25650 CE / Buy 26150 CE", "lots": 1, "qty": 75, "exch": "NFO", "legs": [{"action": "BUY", "strike": 26150, "side": "CE", "entry_ltp": 5.85, "symbol": "NIFTY23NOV2626150CE", "token": "64503", "exch": "NFO"}, {"action": "SELL", "strike": 25650, "side": "CE", "entry_ltp": 81.55, "symbol": "NIFTY23NOV2625650CE", "token": "64479", "exch": "NFO"}], "entry_time": "10:00:05 AM", "sl_rs": 1700.0}
