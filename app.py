@@ -31,7 +31,7 @@ from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 try:
     from pages.greek_regime_indicator import evaluate_greeks_regime
 except ImportError:
-    from pages.greeks_regime_indicator import evaluate_greeks_regime
+    from pages.greek_regime_indicator import evaluate_greeks_regime
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -42,7 +42,7 @@ OC_RECORD_FILE = "recorded_oc_history.csv"
 DEFAULT_GH_REPO = "Sarveshbaghel05/algo-trading-app"
 
 # ==========================================
-# Direct GitHub Permanent Storage
+# Direct GitHub Permanent Storage (डेटा सुरक्षा)
 # ==========================================
 def _get_gh_config():
     try:
@@ -91,7 +91,7 @@ def gh_write_file(filepath, text_content, commit_msg):
     if sha:
         payload["sha"] = sha
     try:
-        res = requests.put(url, json=payload, headers=headers, timeout=10)
+        res = requests.put(url, json=payload, headers=headers, timeout=12)
         if res.status_code in [200, 201]:
             return True, "Saved ✅"
         return False, f"Save Err {res.status_code}: {res.json().get('message', '')}"
@@ -146,8 +146,46 @@ def save_active_trade(trade_dict):
     ok, msg = gh_write_file(ACTIVE_TRADE_FILE, text_data, "Update active trade state")
     st.session_state["gh_sync_status"] = f"☁️ {msg}" if ok else f"⚠️ {msg}"
 
+def sync_recorded_oc_to_github(force_now=False):
+    """रिकॉर्ड किए गए Option Chain हिस्टोरिकल डेटा को सुरक्षित रूप से GitHub पर सिंक करना"""
+    try:
+        if not os.path.exists(OC_RECORD_FILE):
+            # यदि लोकल फाइल नहीं है, तो GitHub से पुरानी फाइल लाकर लोकल में रखें
+            raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
+            if raw_gh:
+                with open(OC_RECORD_FILE, "w", encoding="utf-8") as f:
+                    f.write(raw_gh)
+                return True, "GitHub से पुराना डेटा लोड हो गया ✅"
+            return False, "अभी तक कोई रिकॉर्डेड डेटा नहीं है।"
+
+        local_df = pd.read_csv(OC_RECORD_FILE)
+        if local_df.empty:
+            return False, "डेटा खाली है।"
+
+        # GitHub पर पहले से मौजूद डेटा के साथ मर्ज करें ताकि पुराना डेटा कभी न कटे
+        raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
+        if raw_gh:
+            try:
+                gh_df = pd.read_csv(StringIO(raw_gh))
+                merged_df = pd.concat([gh_df, local_df], ignore_index=True)
+                merged_df = merged_df.drop_duplicates(subset=["Date", "Time", "Index", "STRIKE"], keep="last")
+            except Exception:
+                merged_df = local_df
+        else:
+            merged_df = local_df
+
+        merged_df.to_csv(OC_RECORD_FILE, index=False)
+        csv_payload = merged_df.to_csv(index=False)
+        ok, msg = gh_write_file(OC_RECORD_FILE, csv_payload, "Auto-sync Option Chain historical data")
+        if ok:
+            st.session_state["last_oc_gh_sync_ts"] = time.time()
+            return True, f"GitHub पर {merged_df['Date'].nunique()} दिन का डेटा सुरक्षित सेव हो गया ✅"
+        return False, msg
+    except Exception as e:
+        return False, str(e)
+
 def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
-    """लाइव मार्केट (9:15 AM - 3:30 PM) में हर 1 मिनट का असली Option Chain डेटा सेव करना"""
+    """लाइव मार्केट (9:15 AM - 3:30 PM) में हर 1 मिनट का असली Option Chain डेटा सेव और ऑटो-सिंक करना"""
     try:
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
@@ -161,6 +199,14 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
         if st.session_state.get("last_recorded_minute") == minute_key:
             return
 
+        # पहली बार लोकल फाइल न होने पर GitHub से पुरानी फाइल मंगवा लें ताकि डेटा जुड़े (Append हो)
+        if not os.path.exists(OC_RECORD_FILE) and not st.session_state.get("oc_gh_bootstrapped"):
+            st.session_state["oc_gh_bootstrapped"] = True
+            raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
+            if raw_gh:
+                with open(OC_RECORD_FILE, "w", encoding="utf-8") as f:
+                    f.write(raw_gh)
+
         save_df = df_oc.copy()
         save_df.insert(0, "Timestamp", now_ist.strftime("%Y-%m-%d %H:%M:%S"))
         save_df.insert(1, "Date", now_ist.strftime("%Y-%m-%d"))
@@ -172,6 +218,11 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
         write_header = not os.path.exists(OC_RECORD_FILE)
         save_df.to_csv(OC_RECORD_FILE, mode="a", header=write_header, index=False)
         st.session_state["last_recorded_minute"] = minute_key
+
+        # हर 15 मिनट (900 सेकंड) में अपने आप GitHub पर बैकअप सेव करना
+        last_sync = st.session_state.get("last_oc_gh_sync_ts", 0)
+        if time.time() - last_sync >= 900:
+            sync_recorded_oc_to_github()
     except Exception:
         pass
 
@@ -198,12 +249,16 @@ if "auto_traded_date" not in st.session_state:
     st.session_state["auto_traded_date"] = ""
 if "last_tg_update_id" not in st.session_state:
     st.session_state["last_tg_update_id"] = 0
-if "base_oi_map" not in st.session_state:
-    st.session_state["base_oi_map"] = {}
-if "base_oi_date" not in st.session_state:
-    st.session_state["base_oi_date"] = ""
+if "prev_close_oi_map" not in st.session_state:
+    st.session_state["prev_close_oi_map"] = {}
+if "prev_close_oi_date" not in st.session_state:
+    st.session_state["prev_close_oi_date"] = ""
 if "last_recorded_minute" not in st.session_state:
     st.session_state["last_recorded_minute"] = ""
+if "last_oc_gh_sync_ts" not in st.session_state:
+    st.session_state["last_oc_gh_sync_ts"] = 0
+if "oc_gh_bootstrapped" not in st.session_state:
+    st.session_state["oc_gh_bootstrapped"] = False
 
 # ==========================================
 # Telegram Alert और Remote Command फंक्शन्स
@@ -374,6 +429,46 @@ def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
         pass
     return {}
 
+@st.cache_data(ttl=3600)
+def fetch_prev_day_closing_oi(jwt_token, api_key, exchange, symbol_token, today_date_str):
+    """Angel One 1-Day Historical Candle से पिछले ट्रेडिंग दिन का असली बंद (Closing) OI निकालना"""
+    hist_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+        "X-PrivateKey": api_key.strip()
+    }
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+    from_dt = now_ist - timedelta(days=7)
+    payload = {
+        "exchange": exchange,
+        "symboltoken": str(symbol_token),
+        "interval": "ONE_DAY",
+        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+        "todate": now_ist.strftime("%Y-%m-%d 15:30")
+    }
+    try:
+        res = requests.post(hist_url, json=payload, headers=headers, timeout=5).json()
+        if res.get("status") and res.get("data"):
+            candles = res["data"]
+            # आज से ठीक पहले वाली कैंडल (पिछले ट्रेडिंग दिन की क्लोजिंग) चुनें
+            prev_candles = [c for c in candles if str(c[0])[:10] < today_date_str]
+            if prev_candles:
+                last_prev = prev_candles[-1]
+                # Angel One कैंडल फॉर्मेट: [Timestamp, Open, High, Low, Close, Volume, OI]
+                if len(last_prev) >= 7 and last_prev[6] is not None:
+                    return int(float(last_prev[6]))
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=5)
 def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     headers = {
@@ -485,6 +580,7 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
         pe_api_chg = int(float(pe_q.get("netChangeOpnInterest", 0) or 0))
 
         raw_rows.append({
+            "EXCH": idx_info["opt_exch"],
             "CE_TOKEN": ce_tok,
             "PE_TOKEN": pe_tok,
             "CALL VOL": int(float(ce_q.get("tradeVolume", 0) or 0)),
@@ -507,32 +603,52 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
     ist = pytz.timezone('Asia/Kolkata')
     today_str = datetime.now(ist).strftime("%Y-%m-%d")
-    if st.session_state["base_oi_date"] != today_str:
-        st.session_state["base_oi_date"] = today_str
-        st.session_state["base_oi_map"] = {}
+    if st.session_state["prev_close_oi_date"] != today_str:
+        st.session_state["prev_close_oi_date"] = today_str
+        st.session_state["prev_close_oi_map"] = {}
 
     df = raw_df.copy()
     call_chgs = []
     put_chgs = []
 
     for _, row in df.iterrows():
+        exch = row["EXCH"]
         ce_tok = row["CE_TOKEN"]
         pe_tok = row["PE_TOKEN"]
         ce_oi = int(row["CALL OI"])
         pe_oi = int(row["PUT OI"])
 
-        if ce_tok and ce_tok not in st.session_state["base_oi_map"] and ce_oi > 0:
-            st.session_state["base_oi_map"][ce_tok] = ce_oi
-        if pe_tok and pe_tok not in st.session_state["base_oi_map"] and pe_oi > 0:
-            st.session_state["base_oi_map"][pe_tok] = pe_oi
+        # पिछले दिन का बंद (Closing) OI एक बार 1-Day Candle से निकालकर Cache करना
+        if ce_tok and ce_tok not in st.session_state["prev_close_oi_map"]:
+            prev_ce = fetch_prev_day_closing_oi(jwt_token, api_key, exch, ce_tok, today_str)
+            if prev_ce is not None and prev_ce > 0:
+                st.session_state["prev_close_oi_map"][ce_tok] = prev_ce
+            elif int(row["API_CE_CHG"]) != 0:
+                st.session_state["prev_close_oi_map"][ce_tok] = ce_oi - int(row["API_CE_CHG"])
+            else:
+                st.session_state["prev_close_oi_map"][ce_tok] = ce_oi
+            time.sleep(0.05)
 
-        ce_chg = int(row["API_CE_CHG"])
-        if ce_chg == 0 and ce_tok in st.session_state["base_oi_map"]:
-            ce_chg = ce_oi - st.session_state["base_oi_map"][ce_tok]
+        if pe_tok and pe_tok not in st.session_state["prev_close_oi_map"]:
+            prev_pe = fetch_prev_day_closing_oi(jwt_token, api_key, exch, pe_tok, today_str)
+            if prev_pe is not None and prev_pe > 0:
+                st.session_state["prev_close_oi_map"][pe_tok] = prev_pe
+            elif int(row["API_PE_CHG"]) != 0:
+                st.session_state["prev_close_oi_map"][pe_tok] = pe_oi - int(row["API_PE_CHG"])
+            else:
+                st.session_state["prev_close_oi_map"][pe_tok] = pe_oi
+            time.sleep(0.05)
 
-        pe_chg = int(row["API_PE_CHG"])
-        if pe_chg == 0 and pe_tok in st.session_state["base_oi_map"]:
-            pe_chg = pe_oi - st.session_state["base_oi_map"][pe_tok]
+        # असली Change in OI = आज का लाइव OI - कल का बंद OI
+        if ce_tok in st.session_state["prev_close_oi_map"] and ce_oi > 0:
+            ce_chg = ce_oi - st.session_state["prev_close_oi_map"][ce_tok]
+        else:
+            ce_chg = int(row["API_CE_CHG"])
+
+        if pe_tok in st.session_state["prev_close_oi_map"] and pe_oi > 0:
+            pe_chg = pe_oi - st.session_state["prev_close_oi_map"][pe_tok]
+        else:
+            pe_chg = int(row["API_PE_CHG"])
 
         call_chgs.append(ce_chg)
         put_chgs.append(pe_chg)
@@ -1047,7 +1163,7 @@ with tab1:
 
             st.markdown(f"""
             <div style="background: {g_info.get('bg_color', 'linear-gradient(90deg, #1e293b, #0f172a)')}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info.get('border_color', '#38bdf8')}; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:,}</b> | 🛡️ हेज दूरी: <b>{hedge_pts} pts</b></div>
+                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | ऊपर 3 Call Chg OI: <b>{up_3_call_chg:+,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:+,}</b> | 🛡️ हेज दूरी: <b>{hedge_pts} pts</b></div>
                 <div style="font-size: 21px; font-weight: bold; margin: 6px 0;">{g_info.get('headline', '🟡 बाज़ार विश्लेषण')}</div>
                 <div style="font-size: 16px; font-weight: bold; color: #fde047; margin-bottom: 6px;">🎯 एल्गो ऑटो-रणनीति: {strat_name}</div>
                 <div style="font-size: 14px; color: #f8fafc;">{legs_html} &nbsp;➔&nbsp; अनुमानित नेट क्रेडिट: <b>₹{est_credit_rs:,.0f}</b> &nbsp;|&nbsp; 🛑 SL: <b>₹{1700 * lots_cnt:,.0f}</b></div>
@@ -1258,7 +1374,17 @@ with tab3:
         except Exception:
             rec_days_count = 0
 
-    st.caption(f"💾 **ऑटो-रिकॉर्डेड असली Option Chain डेटा:** `{rec_days_count} दिन` सेव हो चुके हैं (`{OC_RECORD_FILE}` — लाइव मार्केट में ऐप खुलते ही हर मिनट अपने आप रिकॉर्ड होता है)।")
+    sync_c1, sync_c2 = st.columns([3, 1])
+    with sync_c1:
+        st.caption(f"💾 **ऑटो-रिकॉर्डेड असली Option Chain डेटा:** `{rec_days_count} दिन` सेव हो चुके हैं (`{OC_RECORD_FILE}` — लाइव मार्केट में हर 1 मिनट रिकॉर्ड होकर हर 15 मिनट में अपने आप GitHub पर सेव होता है)।")
+    with sync_c2:
+        if st.button("☁️ अभी GitHub पर डेटा सेव करें", use_container_width=True):
+            with st.spinner("GitHub पर हिस्टोरिकल डेटा सिंक हो रहा है..."):
+                ok_s, msg_s = sync_recorded_oc_to_github(force_now=True)
+                if ok_s:
+                    st.success(msg_s)
+                else:
+                    st.warning(msg_s)
 
     bt_source = st.radio(
         "बैकटेस्ट डेटा स्रोत चुनें:",
@@ -1318,6 +1444,8 @@ with tab3:
 
             if "रिकॉर्डेड" in bt_source:
                 if not os.path.exists(OC_RECORD_FILE):
+                    sync_recorded_oc_to_github()
+                if not os.path.exists(OC_RECORD_FILE):
                     st.warning("अभी तक कोई रिकॉर्डेड डेटा फाइल नहीं बनी है। लाइव मार्केट के दौरान ऐप खोलें, डेटा अपने आप सेव होने लगेगा।")
                 else:
                     rec_df = pd.read_csv(OC_RECORD_FILE)
@@ -1344,7 +1472,6 @@ with tab3:
                             atm_1000 = round(spot_1000 / step) * step
                             exp_lbl = str(oc_10["Expiry"].iloc[0]) if "Expiry" in oc_10.columns else "Expiry"
 
-                            # ठीक Tab 1 वाला ही evaluate_greeks_regime और build_strategy_plan उपयोग करना
                             g_info_bt = evaluate_greeks_regime(bt_idx, spot_1000, oc_10, exp_lbl)
                             m_dir = g_info_bt.get("direction", "SIDEWAYS")
                             if m_dir not in ["UP", "DOWN", "SIDEWAYS"]:
@@ -1354,7 +1481,6 @@ with tab3:
                                 m_dir, bt_idx, atm_1000, hedge_points, oc_10
                             )
 
-                            # Entry कीमतें
                             for lg in plan_legs:
                                 col_nm = "CALL LTP" if lg["side"] == "CE" else "PUT LTP"
                                 r_match = oc_10[oc_10["STRIKE"] == lg["strike"]]
@@ -1457,8 +1583,6 @@ with tab3:
                             daily_iv = min(0.32, max(base_iv * 0.85, morning_range_pct * 16.0))
                             t_entry = (days_to_exp + (315.0 / 375.0)) / 365.0
 
-                            # सुबह की 45-मिनट चाल के आधार पर 10:00 AM पर 3-Strike OI और Option Chain बनाना
-                            # ताकि Tab 1 का ही evaluate_greeks_regime और build_strategy_plan ठीक वैसे ही चले
                             move_pct = ((spot_1000 - open_915) / open_915) * 100.0
                             strikes_sim = [atm_1000 + (i * step) for i in range(-16, 17)]
                             sim_rows = []
@@ -1466,15 +1590,12 @@ with tab3:
                                 ce_p = bs_option_price(spot_1000, k, t_entry, daily_iv, "CE")
                                 pe_p = bs_option_price(spot_1000, k, t_entry, daily_iv, "PE")
                                 if move_pct >= 0.22:
-                                    # तेज़ी: नीचे के Put में ज़्यादा OI जुड़ना
                                     c_chg = 15000 if k > atm_1000 else 5000
                                     p_chg = 45000 if k < atm_1000 else 10000
                                 elif move_pct <= -0.22:
-                                    # मंदी: ऊपर के Call में ज़्यादा OI जुड़ना
                                     c_chg = 45000 if k > atm_1000 else 10000
                                     p_chg = 15000 if k < atm_1000 else 5000
                                 else:
-                                    # साइडवेज: दोनों तरफ़ संतुलित OI और शांत बाज़ार
                                     c_chg = 30000 if k > atm_1000 else 10000
                                     p_chg = 30000 if k < atm_1000 else 10000
                                 sim_rows.append({
@@ -1490,7 +1611,6 @@ with tab3:
                                 })
                             sim_oc_df = pd.DataFrame(sim_rows)
 
-                            # ठीक Tab 1 वाला ही दिशा इंजन और रणनीति बिल्डर
                             g_info_bt = evaluate_greeks_regime(bt_idx, spot_1000, sim_oc_df, "Backtest")
                             m_dir = g_info_bt.get("direction", "SIDEWAYS")
                             if m_dir not in ["UP", "DOWN", "SIDEWAYS"]:
@@ -1515,7 +1635,6 @@ with tab3:
                                 mins_left_today = max(15.0, 315.0 * (1.0 - (idx_bar / max(1, total_bars - 1))))
                                 t_curr = (days_to_exp + (mins_left_today / 375.0)) / 365.0
 
-                                # कैंडल के High और Low दोनों पर MTM जांचना (4-Leg Straddle में दोनों तरफ़ का खतरा होता है)
                                 worst_mtm_rs = 0.0
                                 worst_leg_prices = {}
                                 for cand_spot in [float(row["Low"]), float(row["High"])]:
@@ -1621,5 +1740,3 @@ with tab3:
                 st.dataframe(res_df, use_container_width=True, hide_index=True)
             else:
                 st.info("चुने गए DTE फ़िल्टर के लिए इस अवधि में कोई ट्रेड नहीं मिला।")
-
-# === END OF APP.PY ===
