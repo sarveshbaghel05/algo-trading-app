@@ -27,7 +27,6 @@ from io import StringIO
 from datetime import datetime, timedelta
 import pytz
 
-# OTM IV Indicator सेफ इम्पोर्ट
 try:
     from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 except ImportError:
@@ -43,14 +42,8 @@ except ImportError:
                 "message": "OTM IV मॉड्यूल लोड हो रहा है।"
             }
 
-# Greeks Regime Indicator सेफ इम्पोर्ट (सभी संभावित नामों और फोल्डर के साथ + इन-बिल्ट बैकअप)
 evaluate_greeks_regime = None
-for _mod_name in [
-    "pages.greek_regime_indicator",
-    "greek_regime_indicator",
-    "pages.greeks_regime_indicator",
-    "greeks_regime_indicator"
-]:
+for _mod_name in ["pages.greek_regime_indicator", "greek_regime_indicator", "pages.greeks_regime_indicator", "greeks_regime_indicator"]:
     try:
         _mod = __import__(_mod_name, fromlist=["evaluate_greeks_regime"])
         evaluate_greeks_regime = getattr(_mod, "evaluate_greeks_regime")
@@ -66,28 +59,11 @@ if evaluate_greeks_regime is None:
         dn_df = full_df[(full_df["STRIKE"] < atm) & (full_df["STRIKE"] >= atm - 3 * step)]
         up_ce = int(up_df["CALL CHG OI"].sum()) if not up_df.empty else 0
         dn_pe = int(dn_df["PUT CHG OI"].sum()) if not dn_df.empty else 0
-
-        if dn_pe > up_ce * 1.35 and dn_pe > 0:
-            return {
-                "direction": "UP",
-                "headline": "🟢 तेज़ी का संकेत (Bullish — नीचे Put राइटिंग मज़बूत)",
-                "bg_color": "linear-gradient(90deg, #064e3b, #022c22)",
-                "border_color": "#10b981"
-            }
-        elif up_ce > dn_pe * 1.35 and up_ce > 0:
-            return {
-                "direction": "DOWN",
-                "headline": "🔴 मंदी का संकेत (Bearish — ऊपर Call राइटिंग मज़बूत)",
-                "bg_color": "linear-gradient(90deg, #7f1d1d, #450a0a)",
-                "border_color": "#ef4444"
-            }
-        else:
-            return {
-                "direction": "SIDEWAYS",
-                "headline": "🟡 साइडवेज़ बाज़ार (Range-Bound — दोनों तरफ़ संतुलित OI)",
-                "bg_color": "linear-gradient(90deg, #1e293b, #0f172a)",
-                "border_color": "#f59e0b"
-            }
+        if dn_pe > up_ce * 1.25 and dn_pe > 0:
+            return {"direction": "UP", "headline": "🟢 तेज़ी का संकेत (BULLISH)", "bg_color": "linear-gradient(90deg, #064e3b, #022c22)", "border_color": "#10b981"}
+        elif up_ce > dn_pe * 1.25 and up_ce > 0:
+            return {"direction": "DOWN", "headline": "🔴 मंदी का संकेत (BEARISH)", "bg_color": "linear-gradient(90deg, #7f1d1d, #450a0a)", "border_color": "#ef4444"}
+        return {"direction": "SIDEWAYS", "headline": "🟡 साइडवेज़ बाज़ार (RANGE-BOUND)", "bg_color": "linear-gradient(90deg, #1e293b, #0f172a)", "border_color": "#f59e0b"}
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -95,10 +71,11 @@ st.title("🛡️ ऑप्शन सेलर एल्गो टर्मि�
 HISTORY_FILE = "paper_trades_history.csv"
 ACTIVE_TRADE_FILE = "active_trade_state.json"
 OC_RECORD_FILE = "recorded_oc_history.csv"
+BASE_OI_FILE = "daily_base_oi.json"
 DEFAULT_GH_REPO = "Sarveshbaghel05/algo-trading-app"
 
 # ==========================================
-# Direct GitHub Permanent Storage (डेटा सुरक्षा)
+# Direct GitHub Permanent Storage
 # ==========================================
 def _get_gh_config():
     try:
@@ -113,10 +90,7 @@ def gh_read_file(filepath):
     if not token:
         return None, None, "GITHUB_TOKEN Secret नहीं मिला"
     url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     try:
         res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
@@ -136,10 +110,7 @@ def gh_write_file(filepath, text_content, commit_msg):
         return False, "GITHUB_TOKEN Missing"
     _, sha, _ = gh_read_file(filepath)
     url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     payload = {
         "message": commit_msg,
         "content": base64.b64encode(text_content.encode("utf-8")).decode("utf-8")
@@ -153,6 +124,25 @@ def gh_write_file(filepath, text_content, commit_msg):
         return False, f"Save Err {res.status_code}: {res.json().get('message', '')}"
     except Exception as e:
         return False, str(e)
+
+def load_shared_base_oi():
+    ist = pytz.timezone("Asia/Kolkata")
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+    if st.session_state.get("shared_base_oi_date") != today_str:
+        st.session_state["shared_base_oi_date"] = today_str
+        st.session_state["shared_base_oi_map"] = {}
+        raw_json, _, _ = gh_read_file(BASE_OI_FILE)
+        if raw_json:
+            try:
+                data = json.loads(raw_json)
+                if data.get("date") == today_str and isinstance(data.get("oi_map"), dict):
+                    st.session_state["shared_base_oi_map"] = {str(k): int(v) for k, v in data["oi_map"].items()}
+            except Exception:
+                pass
+    return st.session_state["shared_base_oi_map"], today_str
+
+def save_shared_base_oi(oi_map, today_str):
+    gh_write_file(BASE_OI_FILE, json.dumps({"date": today_str, "oi_map": oi_map}), f"Save daily base OI {today_str}")
 
 def load_trade_history():
     raw_csv, _, status = gh_read_file(HISTORY_FILE)
@@ -202,8 +192,7 @@ def save_active_trade(trade_dict):
     ok, msg = gh_write_file(ACTIVE_TRADE_FILE, text_data, "Update active trade state")
     st.session_state["gh_sync_status"] = f"☁️ {msg}" if ok else f"⚠️ {msg}"
 
-def sync_recorded_oc_to_github(force_now=False):
-    """रिकॉर्ड किए गए Option Chain हिस्टोरिकल डेटा को सुरक्षित रूप से GitHub पर सिंक करना"""
+def sync_recorded_oc_to_github():
     try:
         if not os.path.exists(OC_RECORD_FILE):
             raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
@@ -239,7 +228,6 @@ def sync_recorded_oc_to_github(force_now=False):
         return False, str(e)
 
 def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
-    """लाइव मार्केट (9:15 AM - 3:30 PM) में हर 1 मिनट का असली Option Chain डेटा सेव और ऑटो-सिंक करना"""
     try:
         ist = pytz.timezone('Asia/Kolkata')
         now_ist = datetime.now(ist)
@@ -283,28 +271,17 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
 # ==========================================
 if "gh_sync_status" not in st.session_state:
     st.session_state["gh_sync_status"] = "Checking..."
-
 if "trade_history" not in st.session_state:
     st.session_state["trade_history"] = load_trade_history()
-
 if "paper_capital" not in st.session_state:
-    saved_pnl = sum(
-        float(t.get("लाभ / हानि (₹)", 0))
-        for t in st.session_state["trade_history"]
-        if t.get("मोड") == "Paper"
-    )
+    saved_pnl = sum(float(t.get("लाभ / हानि (₹)", 0)) for t in st.session_state["trade_history"] if t.get("मोड") == "Paper")
     st.session_state["paper_capital"] = 200000.0 + saved_pnl
-
 if "active_trade" not in st.session_state:
     st.session_state["active_trade"] = load_active_trade()
 if "auto_traded_date" not in st.session_state:
     st.session_state["auto_traded_date"] = ""
 if "last_tg_update_id" not in st.session_state:
     st.session_state["last_tg_update_id"] = 0
-if "prev_close_oi_map" not in st.session_state:
-    st.session_state["prev_close_oi_map"] = {}
-if "prev_close_oi_date" not in st.session_state:
-    st.session_state["prev_close_oi_date"] = ""
 if "last_recorded_minute" not in st.session_state:
     st.session_state["last_recorded_minute"] = ""
 if "last_oc_gh_sync_ts" not in st.session_state:
@@ -316,19 +293,13 @@ if "oc_gh_bootstrapped" not in st.session_state:
 # Telegram Alert और Remote Command फंक्शन्स
 # ==========================================
 def send_telegram_alert(message_text):
-    """Telegram पर तुरंत ट्रेड और SL अलर्ट भेजना"""
     try:
         bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
         if not bot_token or not chat_id:
             return False, "Telegram Secrets सेव नहीं हैं।"
-
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message_text,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": chat_id, "text": message_text, "parse_mode": "HTML"}
         res = requests.post(url, json=payload, timeout=5).json()
         if res.get("ok"):
             return True, "Sent"
@@ -337,30 +308,24 @@ def send_telegram_alert(message_text):
         return False, str(e)
 
 def check_telegram_commands():
-    """Telegram से भेजे गए /exit या /status कमांड पढ़ना"""
     try:
         bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "").strip()
         allowed_chat_id = str(st.secrets.get("TELEGRAM_CHAT_ID", "")).strip()
         if not bot_token or not allowed_chat_id:
             return None
-
         url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
         params = {"offset": st.session_state["last_tg_update_id"] + 1, "timeout": 1}
         res = requests.get(url, params=params, timeout=3).json()
-
         if not res.get("ok"):
             return None
-
         detected_cmd = None
         for update in res.get("result", []):
             upd_id = update.get("update_id", 0)
             if upd_id > st.session_state["last_tg_update_id"]:
                 st.session_state["last_tg_update_id"] = upd_id
-
             msg = update.get("message", {})
             sender_id = str(msg.get("chat", {}).get("id", ""))
             text = msg.get("text", "").strip().upper()
-
             if sender_id == allowed_chat_id:
                 if text in ["/EXIT", "EXIT", "STOP", "CLOSE"]:
                     detected_cmd = "EXIT"
@@ -384,20 +349,12 @@ def angel_login(api_key, client_id, mpin, totp_secret):
         totp = pyotp.TOTP(totp_secret.strip().replace(" ", "")).now()
         url = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
         headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-UserType": "USER",
-            "X-SourceID": "WEB",
-            "X-ClientLocalIP": "127.0.0.1",
-            "X-ClientPublicIP": "127.0.0.1",
-            "X-MACAddress": "00:00:00:00:00:00",
-            "X-PrivateKey": api_key.strip()
+            "Content-Type": "application/json", "Accept": "application/json",
+            "X-UserType": "USER", "X-SourceID": "WEB",
+            "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+            "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": api_key.strip()
         }
-        payload = {
-            "clientcode": client_id.strip(),
-            "password": mpin.strip(),
-            "totp": totp
-        }
+        payload = {"clientcode": client_id.strip(), "password": mpin.strip(), "totp": totp}
         res = requests.post(url, json=payload, headers=headers, timeout=10).json()
         if res.get("status") and res.get("data", {}).get("jwtToken"):
             return res["data"]["jwtToken"], None
@@ -423,29 +380,16 @@ if "angel_jwt" not in st.session_state:
 def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token, transaction_type, quantity):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder"
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "00:00:00:00:00:00",
-        "X-PrivateKey": api_key.strip()
+        "Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json", "Accept": "application/json",
+        "X-UserType": "USER", "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": api_key.strip()
     }
     payload = {
-        "variety": "NORMAL",
-        "tradingsymbol": trading_symbol,
-        "symboltoken": str(symbol_token),
-        "transactiontype": transaction_type,
-        "exchange": exchange,
-        "ordertype": "MARKET",
-        "producttype": "INTRADAY",
-        "duration": "DAY",
-        "price": "0",
-        "squareoff": "0",
-        "stoploss": "0",
-        "quantity": str(quantity)
+        "variety": "NORMAL", "tradingsymbol": trading_symbol, "symboltoken": str(symbol_token),
+        "transactiontype": transaction_type, "exchange": exchange, "ordertype": "MARKET",
+        "producttype": "INTRADAY", "duration": "DAY", "price": "0",
+        "squareoff": "0", "stoploss": "0", "quantity": str(quantity)
     }
     try:
         res = requests.post(url, json=payload, headers=headers, timeout=10).json()
@@ -459,15 +403,10 @@ def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token
 def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
     url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "00:00:00:00:00:00",
-        "X-PrivateKey": api_key.strip()
+        "Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json", "Accept": "application/json",
+        "X-UserType": "USER", "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": api_key.strip()
     }
     valid_tokens = [str(t) for t in tokens_tuple if str(t) and str(t) != "0"]
     if not valid_tokens:
@@ -481,56 +420,13 @@ def get_live_ltp_for_tokens(jwt_token, api_key, exchange, tokens_tuple):
         pass
     return {}
 
-@st.cache_data(ttl=3600)
-def fetch_prev_day_closing_oi(jwt_token, api_key, exchange, symbol_token, today_date_str):
-    """Angel One 1-Day Historical Candle से पिछले ट्रेडिंग दिन का असली बंद (Closing) OI निकालना"""
-    hist_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-    headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "00:00:00:00:00:00",
-        "X-PrivateKey": api_key.strip()
-    }
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
-    from_dt = now_ist - timedelta(days=7)
-    payload = {
-        "exchange": exchange,
-        "symboltoken": str(symbol_token),
-        "interval": "ONE_DAY",
-        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
-        "todate": now_ist.strftime("%Y-%m-%d 15:30")
-    }
-    try:
-        res = requests.post(hist_url, json=payload, headers=headers, timeout=5).json()
-        if res.get("status") and res.get("data"):
-            candles = res["data"]
-            prev_candles = [c for c in candles if str(c[0])[:10] < today_date_str]
-            if prev_candles:
-                last_prev = prev_candles[-1]
-                if len(last_prev) >= 7 and last_prev[6] is not None:
-                    return int(float(last_prev[6]))
-    except Exception:
-        pass
-    return None
-
 @st.cache_data(ttl=5)
 def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "00:00:00:00:00:00",
-        "X-PrivateKey": api_key.strip()
+        "Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json", "Accept": "application/json",
+        "X-UserType": "USER", "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": api_key.strip()
     }
     quote_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
 
@@ -545,7 +441,6 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
         spot_res = requests.post(quote_url, json=spot_payload, headers=headers, timeout=5).json()
         if not spot_res.get("status"):
             return None, None, None, {}, f"Angel API Error: {spot_res.get('message', 'Token Expired')}"
-
         spot_price = float(spot_res["data"]["fetched"][0]["ltp"])
     except Exception as e:
         return None, None, None, {}, f"Spot Fetch Error: {str(e)}"
@@ -577,7 +472,6 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
     exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
     exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
-    # हेज नियम: Nifty 500, Bank Nifty 1000, Sensex 1500
     max_hedge = {"Nifty 50": 500, "Bank Nifty": 1000, "Sensex": 1500}[selected_idx]
     fetch_span = max(s_range * step, max_hedge + step, 3 * step)
     min_s = atm_strike - fetch_span
@@ -623,24 +517,15 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
         ce_q = fetched_map.get(ce_tok, {})
         pe_q = fetched_map.get(pe_tok, {})
 
-        ce_oi = int(float(ce_q.get("opnInterest", 0) or 0))
-        ce_api_chg = int(float(ce_q.get("netChangeOpnInterest", 0) or 0))
-
-        pe_oi = int(float(pe_q.get("opnInterest", 0) or 0))
-        pe_api_chg = int(float(pe_q.get("netChangeOpnInterest", 0) or 0))
-
         raw_rows.append({
-            "EXCH": idx_info["opt_exch"],
             "CE_TOKEN": ce_tok,
             "PE_TOKEN": pe_tok,
             "CALL VOL": int(float(ce_q.get("tradeVolume", 0) or 0)),
-            "API_CE_CHG": ce_api_chg,
-            "CALL OI": ce_oi,
+            "CALL OI": int(float(ce_q.get("opnInterest", 0) or 0)),
             "CALL LTP": float(ce_q.get("ltp", 0.0) or 0.0),
             "STRIKE": st_val,
             "PUT LTP": float(pe_q.get("ltp", 0.0) or 0.0),
-            "PUT OI": pe_oi,
-            "API_PE_CHG": pe_api_chg,
+            "PUT OI": int(float(pe_q.get("opnInterest", 0) or 0)),
             "PUT VOL": int(float(pe_q.get("tradeVolume", 0) or 0))
         })
 
@@ -651,55 +536,34 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
     if raw_df is None or raw_df.empty:
         return raw_df, spot_price, exp_str, contract_map, err
 
-    ist = pytz.timezone('Asia/Kolkata')
-    today_str = datetime.now(ist).strftime("%Y-%m-%d")
-    if st.session_state["prev_close_oi_date"] != today_str:
-        st.session_state["prev_close_oi_date"] = today_str
-        st.session_state["prev_close_oi_map"] = {}
-
+    base_map, today_str = load_shared_base_oi()
+    updated_base = False
     df = raw_df.copy()
     call_chgs = []
     put_chgs = []
 
     for _, row in df.iterrows():
-        exch = row["EXCH"]
         ce_tok = row["CE_TOKEN"]
         pe_tok = row["PE_TOKEN"]
         ce_oi = int(row["CALL OI"])
         pe_oi = int(row["PUT OI"])
 
-        if ce_tok and ce_tok not in st.session_state["prev_close_oi_map"]:
-            prev_ce = fetch_prev_day_closing_oi(jwt_token, api_key, exch, ce_tok, today_str)
-            if prev_ce is not None and prev_ce > 0:
-                st.session_state["prev_close_oi_map"][ce_tok] = prev_ce
-            elif int(row["API_CE_CHG"]) != 0:
-                st.session_state["prev_close_oi_map"][ce_tok] = ce_oi - int(row["API_CE_CHG"])
-            else:
-                st.session_state["prev_close_oi_map"][ce_tok] = ce_oi
-            time.sleep(0.05)
+        if ce_tok and ce_oi > 0 and ce_tok not in base_map:
+            base_map[ce_tok] = ce_oi
+            updated_base = True
+        if pe_tok and pe_oi > 0 and pe_tok not in base_map:
+            base_map[pe_tok] = pe_oi
+            updated_base = True
 
-        if pe_tok and pe_tok not in st.session_state["prev_close_oi_map"]:
-            prev_pe = fetch_prev_day_closing_oi(jwt_token, api_key, exch, pe_tok, today_str)
-            if prev_pe is not None and prev_pe > 0:
-                st.session_state["prev_close_oi_map"][pe_tok] = prev_pe
-            elif int(row["API_PE_CHG"]) != 0:
-                st.session_state["prev_close_oi_map"][pe_tok] = pe_oi - int(row["API_PE_CHG"])
-            else:
-                st.session_state["prev_close_oi_map"][pe_tok] = pe_oi
-            time.sleep(0.05)
-
-        if ce_tok in st.session_state["prev_close_oi_map"] and ce_oi > 0:
-            ce_chg = ce_oi - st.session_state["prev_close_oi_map"][ce_tok]
-        else:
-            ce_chg = int(row["API_CE_CHG"])
-
-        if pe_tok in st.session_state["prev_close_oi_map"] and pe_oi > 0:
-            pe_chg = pe_oi - st.session_state["prev_close_oi_map"][pe_tok]
-        else:
-            pe_chg = int(row["API_PE_CHG"])
+        ce_chg = (ce_oi - base_map[ce_tok]) if (ce_tok in base_map and ce_oi > 0) else 0
+        pe_chg = (pe_oi - base_map[pe_tok]) if (pe_tok in base_map and pe_oi > 0) else 0
 
         call_chgs.append(ce_chg)
         put_chgs.append(pe_chg)
+
+    if updated_base:
+        st.session_state["shared_base_oi_map"] = base_map
+        save_shared_base_oi(base_map, today_str)
 
     df["CALL CHG OI"] = call_chgs
     df["PUT CHG OI"] = put_chgs
@@ -714,7 +578,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 # मल्टी-लेग (Bull Put / Bear Call / Straddle + Hedge) एंट्री और एग्जिट इंजन
 # ==========================================
 def build_strategy_plan(direction, selected_idx, atm_strike, hedge_pts, full_df):
-    """दिशा सिग्नल (UP / DOWN / SIDEWAYS) के हिसाब से सही स्ट्राइक और लेग्स तैयार करना"""
     def _get_ltp(strike_val, side_type):
         row = full_df[full_df["STRIKE"] == strike_val]
         col = "CALL LTP" if side_type == "CE" else "PUT LTP"
@@ -752,10 +615,7 @@ def build_strategy_plan(direction, selected_idx, atm_strike, hedge_pts, full_df)
         strat_name = "Straddle with Hedge / Iron Fly (साइडवेज़ ट्रेड)"
         summary = f"Straddle {atm_strike} CE+PE Sell / Hedge {buy_ce} CE & {buy_pe} PE Buy"
 
-    net_credit_pts = sum(
-        lg["entry_ltp"] if lg["action"] == "SELL" else -lg["entry_ltp"]
-        for lg in legs
-    )
+    net_credit_pts = sum(lg["entry_ltp"] if lg["action"] == "SELL" else -lg["entry_ltp"] for lg in legs)
     return strat_name, summary, legs, round(net_credit_pts, 2)
 
 
@@ -915,15 +775,10 @@ def close_active_trade(curr_ltp_by_idx, reason="Manual Exit"):
 
 def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": "127.0.0.1",
-        "X-ClientPublicIP": "127.0.0.1",
-        "X-MACAddress": "00:00:00:00:00:00",
-        "X-PrivateKey": api_key.strip()
+        "Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json", "Accept": "application/json",
+        "X-UserType": "USER", "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": api_key.strip()
     }
     hist_url = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
 
@@ -971,7 +826,6 @@ def fetch_angel_historical_spot(jwt_token, api_key, selected_idx, days_count):
     return df.drop_duplicates(subset=["Timestamp"]).sort_values("Timestamp").set_index("Timestamp")
 
 def bs_option_price(spot, strike, t_years, iv, opt_type="CE"):
-    """Black-Scholes ऑप्शन प्राइस कैलकुलेटर (सही Expiry और IV के साथ)"""
     if t_years <= 1e-6:
         return max(0.05, spot - strike) if opt_type == "CE" else max(0.05, strike - spot)
     r = 0.065
@@ -986,7 +840,6 @@ def bs_option_price(spot, strike, t_years, iv, opt_type="CE"):
     return max(0.5, px)
 
 def calc_multileg_charges(sell_turnover, buy_turnover, order_count):
-    """Angel One असली ब्रोकरेज (₹20/ऑर्डर) + STT + NSE/BSE + Stamp Duty + GST"""
     total_turnover = sell_turnover + buy_turnover
     brokerage = 20.0 * order_count
     stt = sell_turnover * 0.0015
@@ -1006,7 +859,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE (Direction-Aware)
+# TAB 1: PAPER TRADING & LIVE ALGO TRADING ENGINE
 # ==========================================
 with tab1:
     st.subheader("🤖 पेपर ट्रेडिंग और लाइव एल्गो कंट्रोल सेंटर (दिशा सिग्नल आधारित)")
@@ -1257,7 +1110,7 @@ with tab1:
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked, auto_10am)
 
 # ==========================================
-# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन + OTM 3-Strike IV इंडिकेटर
+# TAB 2: ऑप्शन सेलर लाइव ऑप्शन चेन
 # ==========================================
 with tab2:
     is_connected = "angel_jwt" in st.session_state
@@ -1302,11 +1155,11 @@ with tab2:
         now_str = datetime.now(ist).strftime("%I:%M:%S %p")
 
         if selected_idx == "Nifty 50":
-            sym, step, default_spot, hedge_pts = "^NSEI", 50, 24000.0, 500
+            sym, step, default_spot = "^NSEI", 50, 24000.0
         elif selected_idx == "Bank Nifty":
-            sym, step, default_spot, hedge_pts = "^NSEBANK", 100, 51000.0, 1000
+            sym, step, default_spot = "^NSEBANK", 100, 51000.0
         else:
-            sym, step, default_spot, hedge_pts = "^BSESN", 100, 79000.0, 1500
+            sym, step, default_spot = "^BSESN", 100, 79000.0
 
         is_live = False
         expiry_label = "Simulation"
@@ -1426,7 +1279,7 @@ with tab3:
     with sync_c2:
         if st.button("☁️ अभी GitHub पर डेटा सेव करें", use_container_width=True):
             with st.spinner("GitHub पर हिस्टोरिकल डेटा सिंक हो रहा है..."):
-                ok_s, msg_s = sync_recorded_oc_to_github(force_now=True)
+                ok_s, msg_s = sync_recorded_oc_to_github()
                 if ok_s:
                     st.success(msg_s)
                 else:
