@@ -250,7 +250,7 @@ def place_order_angel(jwt, akey, exch, sym, tok, side, qty):
 
 @st.cache_data(ttl=8)
 def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
-    """केवल आज की तारीख (9:15 से अब तक) का 1-Min डेटा लाकर VWAP और Opening Range निकालना"""
+    """केवल आज की असली 1-Min कैंडल्स से 9:15 Open, VWAP और ORB निकालना"""
     idx_map = {
         "Nifty 50": {"exch": "NSE", "token": "99926000"},
         "Bank Nifty": {"exch": "NSE", "token": "99926009"},
@@ -276,25 +276,24 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
         ).json()
         if res.get("status") and res.get("data"):
             df = pd.DataFrame(res["data"], columns=["ts", "open", "high", "low", "close", "vol"])
-            df["ts"] = pd.to_datetime(df["ts"])
-            if df["ts"].dt.tz is None:
-                df["ts"] = df["ts"].dt.tz_localize("Asia/Kolkata")
-            else:
-                df["ts"] = df["ts"].dt.tz_convert("Asia/Kolkata")
+            df["ts_str"] = df["ts"].astype(str)
+            df["d_part"] = df["ts_str"].str.slice(0, 10)
+            df["t_part"] = df["ts_str"].str.slice(11, 16)
 
-            # सुरक्षा फ़िल्टर: पिछले दिन की कोई भी कैंडल हटाकर सिर्फ़ आज 9:15 के बाद की कैंडल रखें
-            df = df[(df["ts"].dt.strftime("%Y-%m-%d") == today_str) & (df["ts"].dt.strftime("%H:%M") >= "09:15")].sort_values("ts")
+            df = df[(df["d_part"] == today_str) & (df["t_part"] >= "09:15")].sort_values("t_part")
             if df.empty:
                 return {"ok": False}
 
             df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
             vwap = float((df["typical"] * df["vol"]).sum() / df["vol"].sum()) if df["vol"].sum() > 0 else float(df["typical"].mean())
 
-            orb_df = df[df["ts"].dt.strftime("%H:%M") <= "10:00"]
+            orb_df = df[df["t_part"] <= "10:00"]
             if orb_df.empty:
                 orb_df = df
 
             today_open = float(df["open"].iloc[0])
+            day_high = float(df["high"].max())
+            day_low = float(df["low"].min())
             if today_open <= 0:
                 return {"ok": False}
 
@@ -304,7 +303,9 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
                 "vwap": round(vwap, 2),
                 "open": today_open,
                 "high": float(orb_df["high"].max()),
-                "low": float(orb_df["low"].min())
+                "low": float(orb_df["low"].min()),
+                "day_high": day_high,
+                "day_low": day_low
             }
     except Exception:
         pass
@@ -333,7 +334,7 @@ def _fetch_live_chain_raw(jwt, akey, selected_idx):
         ).json()
         if not s_res.get("status"):
             return None, "Spot API Error"
-        spot = float(s_res["data"]["fetched"][0]["ltp"])
+        spot = float(s_res["data"]["fetched"][0].get("ltp", 0.0) or 0.0)
         if spot <= 0:
             return None, "Spot LTP 0 आ रहा है"
     except Exception as e:
@@ -403,8 +404,8 @@ def _fetch_live_chain_raw(jwt, akey, selected_idx):
         })
 
     return {
-        "raw_df": pd.DataFrame(rows), "spot": spot, "atm": atm, "exp_str": exp_str,
-        "dte": dte, "cmap": cmap, "info": idx_info
+        "raw_df": pd.DataFrame(rows), "spot": spot,
+        "atm": atm, "exp_str": exp_str, "dte": dte, "cmap": cmap, "info": idx_info
     }, None
 
 def fetch_live_chain_strict(jwt, akey, selected_idx):
@@ -450,20 +451,24 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     step = chain_data["info"]["step"]
     df = chain_data["df"]
 
-    if orb_data.get("ok") and orb_data.get("open", 0) > 0 and spot > 0:
-        morning_move_pct = abs((spot - orb_data["open"]) / orb_data["open"]) * 100.0
-        orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0
-    else:
-        morning_move_pct = 0.0
-        orb_range_pct = 0.4
+    today_open = orb_data.get("open", 0.0) if orb_data.get("ok") else 0.0
 
+    if today_open > 0 and spot > 0:
+        signed_move_pct = ((spot - today_open) / today_open) * 100.0
+        morning_move_pct = abs(signed_move_pct)
+    else:
+        signed_move_pct = 0.0
+        morning_move_pct = 0.0
+
+    orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.4
     gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 40)))
 
     if morning_move_pct >= 1.0:
+        dir_txt = "ऊपर (UP)" if signed_move_pct > 0 else "नीचे (DOWN)"
         return {
             "decision": "NO_TRADE",
             "score": "0/3",
-            "reason": f"सुबह 9:15 Open ({orb_data['open']:,.1f}) से अब तक {morning_move_pct:.2f}% बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
+            "reason": f"सुबह 9:15 Open ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
         }
     if gamma_iv >= 68:
         return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 68) — पैनिक मार्केट।"}
@@ -704,8 +709,9 @@ with pro_tab1:
                 st.rerun()
 
         else:
-            open_txt = f"{orb_data['open']:,.2f}" if orb_data.get("ok") else "N/A"
-            move_txt = f"{abs((chain_data['spot'] - orb_data['open']) / orb_data['open']) * 100.0:.2f}%" if orb_data.get("ok") else "0.00%"
+            disp_open = orb_data.get("open", 0.0) if orb_data.get("ok") else 0.0
+            open_txt = f"{disp_open:,.2f}" if disp_open > 0 else "N/A"
+            move_txt = f"{((chain_data['spot'] - disp_open) / disp_open) * 100.0:+.2f}%" if disp_open > 0 else "0.00%"
             st.info(f"📍 **{p_idx} Spot:** `{chain_data['spot']:,.2f}` | **9:15 Open:** `{open_txt}` (`{move_txt}`) | **VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (`{chain_data['dte']} DTE`) | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`")
 
             for d_line in verdict.get("details", []):
@@ -833,11 +839,10 @@ with pro_tab2:
             st.error("ऐतिहासिक डेटा लोड नहीं हो पाया।")
         else:
             df = pd.DataFrame(candles, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
-            df["ts"] = pd.to_datetime(df["ts"])
-            if df["ts"].dt.tz is None:
-                df["ts"] = df["ts"].dt.tz_localize("Asia/Kolkata")
-            df = df.drop_duplicates(subset=["ts"]).sort_values("ts").set_index("ts")
-            df["Date"] = df.index.date
+            df["ts_str"] = df["ts"].astype(str)
+            df["Date"] = df["ts_str"].str.slice(0, 10)
+            df["Time"] = df["ts_str"].str.slice(11, 16)
+            df = df.drop_duplicates(subset=["Date", "Time"]).sort_values(["Date", "Time"])
 
             logs = []
             skipped_days = 0
@@ -846,9 +851,9 @@ with pro_tab2:
             step, hedge = cfg["step"], cfg["hedge"]
             slip_mult = 1.0 if pbt_deduct_costs else 0.0
 
-            for dt, day_df in df.groupby("Date"):
-                morn = day_df.between_time("09:15", "09:59")
-                sess = day_df.between_time("10:00", "15:15")
+            for dt_str, day_df in df.groupby("Date"):
+                morn = day_df[(day_df["Time"] >= "09:15") & (day_df["Time"] <= "09:59")]
+                sess = day_df[(day_df["Time"] >= "10:00") & (day_df["Time"] <= "15:15")]
                 if len(morn) < 5 or len(sess) < 15:
                     continue
 
@@ -866,7 +871,8 @@ with pro_tab2:
                     skipped_days += 1
                     continue
 
-                dte = (cfg["exp_wd"] - dt.weekday()) % 7
+                dt_obj = datetime.strptime(dt_str, "%Y-%m-%d").date()
+                dte = (cfg["exp_wd"] - dt_obj.weekday()) % 7
                 iv = min(0.30, max(cfg["iv"] * 0.85, (rng_pct / 100.0) * 16.0))
                 t0 = (dte + (315.0 / 375.0)) / 365.0
                 otm_off = 0 if dte == 0 else (2 * step)
@@ -978,7 +984,7 @@ with pro_tab2:
                     net_rs = round(gross_rs - charges, 0)
 
                 logs.append({
-                    "तारीख": str(dt),
+                    "तारीख": dt_str,
                     "रणनीति": mode_name,
                     "नतीजा": status,
                     "ब्रोकरेज+टैक्स (₹)": round(charges, 0),
