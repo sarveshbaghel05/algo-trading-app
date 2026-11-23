@@ -2,7 +2,7 @@ import streamlit as st
 
 mode = st.radio(
     "Select Mode:",
-    ["🚀 Live/Paper Algo Terminal", "🧠 Smart 4-Layer Pro Algo", "📊 Manual Options Simulator"],
+    ["🚀 Live/Paper Algo Terminal", "📈 16 EMA + OI Algo", "🧠 Smart 4-Layer Pro Algo", "📊 Manual Options Simulator"],
     horizontal=True
 )
 if mode == "📊 Manual Options Simulator":
@@ -11,6 +11,10 @@ if mode == "📊 Manual Options Simulator":
 elif mode == "🧠 Smart 4-Layer Pro Algo":
     exec(open("pages/pro_algo.py", encoding="utf-8").read())
     st.stop()
+elif mode == "📈 16 EMA + OI Algo":
+    exec(open("pages/ema16_oi_algo.py", encoding="utf-8").read())
+    st.stop()
+
 
 import yfinance as yf
 import pandas as pd
