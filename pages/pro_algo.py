@@ -147,6 +147,8 @@ if "pro_capital" not in st.session_state:
     st.session_state["pro_capital"] = 200000.0 + pnl_sum
 if "pro_tg_offset" not in st.session_state:
     st.session_state["pro_tg_offset"] = 0
+if "pro_spot_track" not in st.session_state:
+    st.session_state["pro_spot_track"] = {}
 
 # ==========================================
 # 3. Telegram Alerts & Control
@@ -249,8 +251,8 @@ def place_order_angel(jwt, akey, exch, sym, tok, side, qty):
         return False, str(e)
 
 @st.cache_data(ttl=8)
-def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
-    """फर्जी 9:15 Open टिक (जैसे 25,929) को फ़िल्टर करके असली 9:15 Close से दिन की शुरुआत नापना"""
+def fetch_intraday_vwap_orb(jwt, akey, selected_idx, live_spot):
+    """फर्जी 25,929 जैसे पुराने डेटा को पूरी तरह ब्लॉक करके सिर्फ़ असली भावों से VWAP और रेंज निकालना"""
     idx_map = {
         "Nifty 50": {"exch": "NSE", "token": "99926000"},
         "Bank Nifty": {"exch": "NSE", "token": "99926009"},
@@ -281,41 +283,34 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
             df["t_part"] = df["ts_str"].str.slice(11, 16)
 
             df = df[(df["d_part"] == today_str) & (df["t_part"] >= "09:15")].sort_values("t_part").reset_index(drop=True)
-            if df.empty:
-                return {"ok": False}
 
-            # 9:15 की पहली कैंडल का Open अक्सर Angel One के इंडेक्स फीड में पुराना/ग्लिच टिक भेजता है,
-            # जबकि 9:15 कैंडल का Close (9:16 AM का भाव) हमेशा 100% असली ट्रेडेड भाव होता है
-            first_close = float(df["close"].iloc[0])
-            first_open = float(df["open"].iloc[0])
-            if first_close > 0 and abs(first_open - first_close) / first_close > 0.005:
-                today_open = first_close
-                df.loc[0, "open"] = first_close
-                df.loc[0, "high"] = max(first_close, float(df.loc[0, "low"]))
-            else:
-                today_open = first_open if first_open > 0 else first_close
+            # सख्त फिल्टर: लाइव Spot से 0.8% से ज़्यादा दूर का कोई भी फर्जी नंबर (जैसे 25,929) पूरी तरह हटाएं
+            if live_spot > 0 and not df.empty:
+                low_bound = live_spot * 0.992
+                high_bound = live_spot * 1.008
+                df = df[
+                    (df["close"] >= low_bound) & (df["close"] <= high_bound) &
+                    (df["open"] >= low_bound) & (df["open"] <= high_bound) &
+                    (df["high"] >= low_bound) & (df["high"] <= high_bound) &
+                    (df["low"] >= low_bound) & (df["low"] <= high_bound)
+                ].reset_index(drop=True)
 
-            # किसी भी कैंडल का फर्जी हाई/लो स्पाइक साफ करें
-            med_close = float(df["close"].median())
-            df = df[(df["close"] > med_close * 0.95) & (df["close"] < med_close * 1.05)]
-            if df.empty or today_open <= 0:
-                return {"ok": False}
+            if not df.empty:
+                df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
+                vwap = float((df["typical"] * df["vol"]).sum() / df["vol"].sum()) if df["vol"].sum() > 0 else float(df["typical"].mean())
 
-            df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
-            vwap = float((df["typical"] * df["vol"]).sum() / df["vol"].sum()) if df["vol"].sum() > 0 else float(df["typical"].mean())
+                orb_df = df[df["t_part"] <= "10:00"]
+                if orb_df.empty:
+                    orb_df = df
 
-            orb_df = df[df["t_part"] <= "10:00"]
-            if orb_df.empty:
-                orb_df = df
-
-            return {
-                "ok": True,
-                "spot": float(df["close"].iloc[-1]),
-                "vwap": round(vwap, 2),
-                "open": today_open,
-                "high": float(orb_df["high"].max()),
-                "low": float(orb_df["low"].min())
-            }
+                return {
+                    "ok": True,
+                    "spot": live_spot,
+                    "vwap": round(vwap, 2),
+                    "open": float(df["open"].iloc[0]),
+                    "high": float(orb_df["high"].max()),
+                    "low": float(orb_df["low"].min())
+                }
     except Exception:
         pass
     return {"ok": False}
@@ -460,7 +455,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     step = chain_data["info"]["step"]
     df = chain_data["df"]
 
-    today_open = orb_data.get("open", 0.0) if orb_data.get("ok") else 0.0
+    today_open = orb_data.get("open", spot) if orb_data.get("ok") else spot
 
     if today_open > 0 and spot > 0:
         signed_move_pct = ((spot - today_open) / today_open) * 100.0
@@ -469,7 +464,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
         signed_move_pct = 0.0
         morning_move_pct = 0.0
 
-    orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.4
+    orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.35
     gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 40)))
 
     if morning_move_pct >= 1.0:
@@ -477,7 +472,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
         return {
             "decision": "NO_TRADE",
             "score": "0/3",
-            "reason": f"सुबह 9:15 ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
+            "reason": f"सुबह ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
         }
     if gamma_iv >= 68:
         return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 68) — पैनिक मार्केट।"}
@@ -491,17 +486,17 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
         pos_in_rng = (spot - orb_data["low"]) / rng
         if spot > vwap and pos_in_rng >= 0.70:
             votes_up += 1
-            details.append(f"✅ L1 (Price): Spot ({spot:,.1f}) VWAP ({vwap:,.1f}) के ऊपर & ORB High के पास (Bullish)")
+            details.append(f"✅ L1 (Price): Spot ({spot:,.1f}) VWAP ({vwap:,.1f}) के ऊपर & Range High के पास (Bullish)")
         elif spot < vwap and pos_in_rng <= 0.30:
             votes_down += 1
-            details.append(f"✅ L1 (Price): Spot ({spot:,.1f}) VWAP ({vwap:,.1f}) के नीचे & ORB Low के पास (Bearish)")
+            details.append(f"✅ L1 (Price): Spot ({spot:,.1f}) VWAP ({vwap:,.1f}) के नीचे & Range Low के पास (Bearish)")
         elif orb_range_pct <= 0.45:
             votes_side += 1
             details.append(f"✅ L1 (Price): छोटी रेंज ({orb_range_pct:.2f}%) और VWAP के पास (Sideways)")
         else:
             details.append(f"⚠️ L1 (Price): दिशा स्पष्ट नहीं (VWAP: {vwap:,.1f}, Range: {orb_range_pct:.2f}%)")
     else:
-        details.append("⚠️ L1 (Price): ORB डेटा प्रतीक्षारत")
+        details.append("⚠️ L1 (Price): इंट्राडे रेंज साफ़ हो रही है (OI व Greeks पर आधारित निर्णय)")
 
     up3 = int(df[(df["STRIKE"] > atm) & (df["STRIKE"] <= atm + 3 * step)]["CALL CHG OI"].sum())
     dn3 = int(df[(df["STRIKE"] < atm) & (df["STRIKE"] >= atm - 3 * step)]["PUT CHG OI"].sum())
@@ -623,8 +618,28 @@ with pro_tab1:
             st.error(f"⚠️ लाइव डेटा रुका हुआ है ({err}) — सुरक्षा नियम के तहत ट्रेड होल्ड पर है।")
             return
 
-        orb_data = fetch_intraday_vwap_orb(jwt, akey, p_idx)
-        g_info = evaluate_greeks_regime(p_idx, chain_data["spot"], chain_data["df"], chain_data["exp_str"])
+        live_spot = chain_data["spot"]
+        orb_data = fetch_intraday_vwap_orb(jwt, akey, p_idx, live_spot)
+
+        # यदि Angel One की सभी शुरुआती कैंडल्स फर्जी हों (जैसे 25,929), तो लाइव असली Spot को बेस बनाएं
+        trk_key = f"{today_str}_{p_idx}"
+        if not orb_data.get("ok"):
+            if trk_key not in st.session_state["pro_spot_track"]:
+                st.session_state["pro_spot_track"][trk_key] = {"open": live_spot, "high": live_spot, "low": live_spot}
+            else:
+                st.session_state["pro_spot_track"][trk_key]["high"] = max(st.session_state["pro_spot_track"][trk_key]["high"], live_spot)
+                st.session_state["pro_spot_track"][trk_key]["low"] = min(st.session_state["pro_spot_track"][trk_key]["low"], live_spot)
+            trk = st.session_state["pro_spot_track"][trk_key]
+            orb_data = {
+                "ok": True,
+                "spot": live_spot,
+                "vwap": round((trk["high"] + trk["low"] + live_spot) / 3.0, 2),
+                "open": trk["open"],
+                "high": trk["high"],
+                "low": trk["low"]
+            }
+
+        g_info = evaluate_greeks_regime(p_idx, live_spot, chain_data["df"], chain_data["exp_str"])
         verdict = run_4layer_decision_engine(chain_data, orb_data, g_info)
 
         active = st.session_state["pro_active"]
@@ -718,10 +733,9 @@ with pro_tab1:
                 st.rerun()
 
         else:
-            disp_open = orb_data.get("open", 0.0) if orb_data.get("ok") else 0.0
-            open_txt = f"{disp_open:,.2f}" if disp_open > 0 else "N/A"
-            move_txt = f"{((chain_data['spot'] - disp_open) / disp_open) * 100.0:+.2f}%" if disp_open > 0 else "0.00%"
-            st.info(f"📍 **{p_idx} Spot:** `{chain_data['spot']:,.2f}` | **9:15 Open:** `{open_txt}` (`{move_txt}`) | **VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (`{chain_data['dte']} DTE`) | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`")
+            disp_open = orb_data.get("open", live_spot)
+            move_txt = f"{((live_spot - disp_open) / disp_open) * 100.0:+.2f}%" if disp_open > 0 else "0.00%"
+            st.info(f"📍 **{p_idx} Spot:** `{live_spot:,.2f}` | **Session Base:** `{disp_open:,.2f}` (`{move_txt}`) | **VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (`{chain_data['dte']} DTE`) | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`")
 
             for d_line in verdict.get("details", []):
                 st.write(d_line)
