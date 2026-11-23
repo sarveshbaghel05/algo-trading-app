@@ -31,7 +31,7 @@ from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 try:
     from pages.greek_regime_indicator import evaluate_greeks_regime
 except ImportError:
-    from pages.greek_regime_indicator import evaluate_greeks_regime
+    from greek_regime_indicator import evaluate_greeks_regime
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -150,7 +150,6 @@ def sync_recorded_oc_to_github(force_now=False):
     """रिकॉर्ड किए गए Option Chain हिस्टोरिकल डेटा को सुरक्षित रूप से GitHub पर सिंक करना"""
     try:
         if not os.path.exists(OC_RECORD_FILE):
-            # यदि लोकल फाइल नहीं है, तो GitHub से पुरानी फाइल लाकर लोकल में रखें
             raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
             if raw_gh:
                 with open(OC_RECORD_FILE, "w", encoding="utf-8") as f:
@@ -162,7 +161,6 @@ def sync_recorded_oc_to_github(force_now=False):
         if local_df.empty:
             return False, "डेटा खाली है।"
 
-        # GitHub पर पहले से मौजूद डेटा के साथ मर्ज करें ताकि पुराना डेटा कभी न कटे
         raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
         if raw_gh:
             try:
@@ -199,7 +197,6 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
         if st.session_state.get("last_recorded_minute") == minute_key:
             return
 
-        # पहली बार लोकल फाइल न होने पर GitHub से पुरानी फाइल मंगवा लें ताकि डेटा जुड़े (Append हो)
         if not os.path.exists(OC_RECORD_FILE) and not st.session_state.get("oc_gh_bootstrapped"):
             st.session_state["oc_gh_bootstrapped"] = True
             raw_gh, _, _ = gh_read_file(OC_RECORD_FILE)
@@ -219,7 +216,6 @@ def record_live_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
         save_df.to_csv(OC_RECORD_FILE, mode="a", header=write_header, index=False)
         st.session_state["last_recorded_minute"] = minute_key
 
-        # हर 15 मिनट (900 सेकंड) में अपने आप GitHub पर बैकअप सेव करना
         last_sync = st.session_state.get("last_oc_gh_sync_ts", 0)
         if time.time() - last_sync >= 900:
             sync_recorded_oc_to_github()
@@ -458,11 +454,9 @@ def fetch_prev_day_closing_oi(jwt_token, api_key, exchange, symbol_token, today_
         res = requests.post(hist_url, json=payload, headers=headers, timeout=5).json()
         if res.get("status") and res.get("data"):
             candles = res["data"]
-            # आज से ठीक पहले वाली कैंडल (पिछले ट्रेडिंग दिन की क्लोजिंग) चुनें
             prev_candles = [c for c in candles if str(c[0])[:10] < today_date_str]
             if prev_candles:
                 last_prev = prev_candles[-1]
-                # Angel One कैंडल फॉर्मेट: [Timestamp, Open, High, Low, Close, Volume, OI]
                 if len(last_prev) >= 7 and last_prev[6] is not None:
                     return int(float(last_prev[6]))
     except Exception:
@@ -618,7 +612,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
         ce_oi = int(row["CALL OI"])
         pe_oi = int(row["PUT OI"])
 
-        # पिछले दिन का बंद (Closing) OI एक बार 1-Day Candle से निकालकर Cache करना
         if ce_tok and ce_tok not in st.session_state["prev_close_oi_map"]:
             prev_ce = fetch_prev_day_closing_oi(jwt_token, api_key, exch, ce_tok, today_str)
             if prev_ce is not None and prev_ce > 0:
@@ -639,7 +632,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
                 st.session_state["prev_close_oi_map"][pe_tok] = pe_oi
             time.sleep(0.05)
 
-        # असली Change in OI = आज का लाइव OI - कल का बंद OI
         if ce_tok in st.session_state["prev_close_oi_map"] and ce_oi > 0:
             ce_chg = ce_oi - st.session_state["prev_close_oi_map"][ce_tok]
         else:
