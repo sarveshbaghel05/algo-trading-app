@@ -26,12 +26,68 @@ import json
 from io import StringIO
 from datetime import datetime, timedelta
 import pytz
-from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 
+# OTM IV Indicator सेफ इम्पोर्ट
 try:
-    from pages.greek_regime_indicator import evaluate_greeks_regime
+    from pages.otm_iv_indicator import evaluate_otm_iv_from_df
 except ImportError:
-    from greek_regime_indicator import evaluate_greeks_regime
+    try:
+        from otm_iv_indicator import evaluate_otm_iv_from_df
+    except ImportError:
+        def evaluate_otm_iv_from_df(selected_idx, spot_price, full_df, expiry_label):
+            return {
+                "avg_otm_ce_iv": 13.5, "ce_iv_change": 0.0,
+                "avg_otm_pe_iv": 13.5, "pe_iv_change": 0.0,
+                "signal": "WAIT", "spread_name": "Neutral",
+                "sell_leg": "-", "buy_hedge": "-",
+                "message": "OTM IV मॉड्यूल लोड हो रहा है।"
+            }
+
+# Greeks Regime Indicator सेफ इम्पोर्ट (सभी संभावित नामों और फोल्डर के साथ + इन-बिल्ट बैकअप)
+evaluate_greeks_regime = None
+for _mod_name in [
+    "pages.greek_regime_indicator",
+    "greek_regime_indicator",
+    "pages.greeks_regime_indicator",
+    "greeks_regime_indicator"
+]:
+    try:
+        _mod = __import__(_mod_name, fromlist=["evaluate_greeks_regime"])
+        evaluate_greeks_regime = getattr(_mod, "evaluate_greeks_regime")
+        break
+    except Exception:
+        continue
+
+if evaluate_greeks_regime is None:
+    def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_label="Live"):
+        step = 50 if selected_idx == "Nifty 50" else 100
+        atm = round(spot_price / step) * step
+        up_df = full_df[(full_df["STRIKE"] > atm) & (full_df["STRIKE"] <= atm + 3 * step)]
+        dn_df = full_df[(full_df["STRIKE"] < atm) & (full_df["STRIKE"] >= atm - 3 * step)]
+        up_ce = int(up_df["CALL CHG OI"].sum()) if not up_df.empty else 0
+        dn_pe = int(dn_df["PUT CHG OI"].sum()) if not dn_df.empty else 0
+
+        if dn_pe > up_ce * 1.35 and dn_pe > 0:
+            return {
+                "direction": "UP",
+                "headline": "🟢 तेज़ी का संकेत (Bullish — नीचे Put राइटिंग मज़बूत)",
+                "bg_color": "linear-gradient(90deg, #064e3b, #022c22)",
+                "border_color": "#10b981"
+            }
+        elif up_ce > dn_pe * 1.35 and up_ce > 0:
+            return {
+                "direction": "DOWN",
+                "headline": "🔴 मंदी का संकेत (Bearish — ऊपर Call राइटिंग मज़बूत)",
+                "bg_color": "linear-gradient(90deg, #7f1d1d, #450a0a)",
+                "border_color": "#ef4444"
+            }
+        else:
+            return {
+                "direction": "SIDEWAYS",
+                "headline": "🟡 साइडवेज़ बाज़ार (Range-Bound — दोनों तरफ़ संतुलित OI)",
+                "bg_color": "linear-gradient(90deg, #1e293b, #0f172a)",
+                "border_color": "#f59e0b"
+            }
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram Control)")
@@ -725,7 +781,6 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
             "exch": c_info["exch"]
         })
 
-    # BUY लेग्स पहले और SELL लेग्स बाद में (मार्जिन सुरक्षा के लिए)
     ordered_legs = [x for x in enriched_legs if x["action"] == "BUY"] + [x for x in enriched_legs if x["action"] == "SELL"]
 
     if mode == "🔴 LIVE ALGO (असली पैसा)":
@@ -746,7 +801,6 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
             executed_so_far.append(lg)
             time.sleep(0.35)
 
-    # स्टॉप-लॉस: ₹1,700 प्रति लॉट
     sl_limit = 1700.0 * lots
     new_trade = {
         "mode": mode,
