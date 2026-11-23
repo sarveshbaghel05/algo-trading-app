@@ -250,7 +250,7 @@ def place_order_angel(jwt, akey, exch, sym, tok, side, qty):
 
 @st.cache_data(ttl=8)
 def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
-    """सुबह 9:15 से अब तक का 1-Min डेटा लाकर VWAP और Opening Range (9:15-10:00) निकालना"""
+    """केवल आज की तारीख (9:15 से अब तक) का 1-Min डेटा लाकर VWAP और Opening Range निकालना"""
     idx_map = {
         "Nifty 50": {"exch": "NSE", "token": "99926000"},
         "Bank Nifty": {"exch": "NSE", "token": "99926009"},
@@ -277,17 +277,32 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
         if res.get("status") and res.get("data"):
             df = pd.DataFrame(res["data"], columns=["ts", "open", "high", "low", "close", "vol"])
             df["ts"] = pd.to_datetime(df["ts"])
+            if df["ts"].dt.tz is None:
+                df["ts"] = df["ts"].dt.tz_localize("Asia/Kolkata")
+            else:
+                df["ts"] = df["ts"].dt.tz_convert("Asia/Kolkata")
+
+            # सुरक्षा फ़िल्टर: पिछले दिन की कोई भी कैंडल हटाकर सिर्फ़ आज 9:15 के बाद की कैंडल रखें
+            df = df[(df["ts"].dt.strftime("%Y-%m-%d") == today_str) & (df["ts"].dt.strftime("%H:%M") >= "09:15")].sort_values("ts")
+            if df.empty:
+                return {"ok": False}
+
             df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
             vwap = float((df["typical"] * df["vol"]).sum() / df["vol"].sum()) if df["vol"].sum() > 0 else float(df["typical"].mean())
 
             orb_df = df[df["ts"].dt.strftime("%H:%M") <= "10:00"]
             if orb_df.empty:
                 orb_df = df
+
+            today_open = float(df["open"].iloc[0])
+            if today_open <= 0:
+                return {"ok": False}
+
             return {
                 "ok": True,
                 "spot": float(df["close"].iloc[-1]),
                 "vwap": round(vwap, 2),
-                "open": float(orb_df["open"].iloc[0]),
+                "open": today_open,
                 "high": float(orb_df["high"].max()),
                 "low": float(orb_df["low"].min())
             }
@@ -298,7 +313,7 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
 @st.cache_data(ttl=8)
 def _fetch_live_chain_raw(jwt, akey, selected_idx):
     idx_info = {
-        "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50, "hedge": 500, "lot": 75},
+        "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50, "hedge": 500, "lot": 65},
         "Bank Nifty": {"exch": "NSE", "token": "99926009", "name": "BANKNIFTY", "opt_exch": "NFO", "step": 100, "hedge": 1000, "lot": 30},
         "Sensex": {"exch": "BSE", "token": "99919000", "name": "SENSEX", "opt_exch": "BFO", "step": 100, "hedge": 1500, "lot": 20}
     }[selected_idx]
@@ -319,6 +334,8 @@ def _fetch_live_chain_raw(jwt, akey, selected_idx):
         if not s_res.get("status"):
             return None, "Spot API Error"
         spot = float(s_res["data"]["fetched"][0]["ltp"])
+        if spot <= 0:
+            return None, "Spot LTP 0 आ रहा है"
     except Exception as e:
         return None, str(e)
 
@@ -433,12 +450,21 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     step = chain_data["info"]["step"]
     df = chain_data["df"]
 
-    morning_move_pct = abs((spot - orb_data["open"]) / orb_data["open"]) * 100.0 if orb_data.get("ok") else 0.0
-    orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.4
+    if orb_data.get("ok") and orb_data.get("open", 0) > 0 and spot > 0:
+        morning_move_pct = abs((spot - orb_data["open"]) / orb_data["open"]) * 100.0
+        orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0
+    else:
+        morning_move_pct = 0.0
+        orb_range_pct = 0.4
+
     gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 40)))
 
     if morning_move_pct >= 1.0:
-        return {"decision": "NO_TRADE", "score": "0/3", "reason": f"सुबह पहले ही {morning_move_pct:.2f}% बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"}
+        return {
+            "decision": "NO_TRADE",
+            "score": "0/3",
+            "reason": f"सुबह 9:15 Open ({orb_data['open']:,.1f}) से अब तक {morning_move_pct:.2f}% बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
+        }
     if gamma_iv >= 68:
         return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 68) — पैनिक मार्केट।"}
 
@@ -678,7 +704,9 @@ with pro_tab1:
                 st.rerun()
 
         else:
-            st.info(f"📍 **{p_idx} Spot:** `{chain_data['spot']:,.2f}` | **VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (`{chain_data['dte']} DTE`) | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`")
+            open_txt = f"{orb_data['open']:,.2f}" if orb_data.get("ok") else "N/A"
+            move_txt = f"{abs((chain_data['spot'] - orb_data['open']) / orb_data['open']) * 100.0:.2f}%" if orb_data.get("ok") else "0.00%"
+            st.info(f"📍 **{p_idx} Spot:** `{chain_data['spot']:,.2f}` | **9:15 Open:** `{open_txt}` (`{move_txt}`) | **VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (`{chain_data['dte']} DTE`) | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`")
 
             for d_line in verdict.get("details", []):
                 st.write(d_line)
@@ -693,7 +721,7 @@ with pro_tab1:
                 max_credit_rs = round(net_credit_pts * total_qty, 0)
                 hard_sl_rs = max(1200.0 * p_lots, round(max_credit_rs * 0.38, 0))
 
-                st.success(f"🎯 **सिग्नल ({verdict['score']}):** {verdict['reason']} ➔ **{strat_name}** | नेट क्रेडिट: `₹{max_credit_rs:,.0f}` | 38% SL: `₹{hard_sl_rs:,.0f}`")
+                st.success(f"🎯 **सिग्नल ({verdict['score']}):** {verdict['reason']} ➔ **{strat_name}** (Lot Size: {lot_qty}) | नेट क्रेडिट: `₹{max_credit_rs:,.0f}` | 38% SL: `₹{hard_sl_rs:,.0f}`")
                 for lg in plan_legs:
                     st.write(f"• **{lg['action']}** {lg['strike']} {lg['side']} @ `₹{lg['entry_ltp']}`")
 
@@ -770,7 +798,7 @@ with pro_tab2:
 
     if st.button("🚀 Pro बैकटेस्ट चलाएं", use_container_width=True):
         cfg = {
-            "Nifty 50": {"exch": "NSE", "tok": "99926000", "step": 50, "lot": 75, "hedge": 500, "exp_wd": 3, "iv": 0.135},
+            "Nifty 50": {"exch": "NSE", "tok": "99926000", "step": 50, "lot": 65, "hedge": 500, "exp_wd": 3, "iv": 0.135},
             "Bank Nifty": {"exch": "NSE", "tok": "99926009", "step": 100, "lot": 30, "hedge": 1000, "exp_wd": 2, "iv": 0.165},
             "Sensex": {"exch": "BSE", "tok": "99919000", "step": 100, "lot": 20, "hedge": 1500, "exp_wd": 4, "iv": 0.145}
         }[pbt_idx]
