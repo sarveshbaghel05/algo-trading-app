@@ -250,7 +250,7 @@ def place_order_angel(jwt, akey, exch, sym, tok, side, qty):
 
 @st.cache_data(ttl=8)
 def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
-    """केवल आज की असली 1-Min कैंडल्स से 9:15 Open, VWAP और ORB निकालना"""
+    """फर्जी 9:15 Open टिक (जैसे 25,929) को फ़िल्टर करके असली 9:15 Close से दिन की शुरुआत नापना"""
     idx_map = {
         "Nifty 50": {"exch": "NSE", "token": "99926000"},
         "Bank Nifty": {"exch": "NSE", "token": "99926009"},
@@ -280,8 +280,25 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
             df["d_part"] = df["ts_str"].str.slice(0, 10)
             df["t_part"] = df["ts_str"].str.slice(11, 16)
 
-            df = df[(df["d_part"] == today_str) & (df["t_part"] >= "09:15")].sort_values("t_part")
+            df = df[(df["d_part"] == today_str) & (df["t_part"] >= "09:15")].sort_values("t_part").reset_index(drop=True)
             if df.empty:
+                return {"ok": False}
+
+            # 9:15 की पहली कैंडल का Open अक्सर Angel One के इंडेक्स फीड में पुराना/ग्लिच टिक भेजता है,
+            # जबकि 9:15 कैंडल का Close (9:16 AM का भाव) हमेशा 100% असली ट्रेडेड भाव होता है
+            first_close = float(df["close"].iloc[0])
+            first_open = float(df["open"].iloc[0])
+            if first_close > 0 and abs(first_open - first_close) / first_close > 0.005:
+                today_open = first_close
+                df.loc[0, "open"] = first_close
+                df.loc[0, "high"] = max(first_close, float(df.loc[0, "low"]))
+            else:
+                today_open = first_open if first_open > 0 else first_close
+
+            # किसी भी कैंडल का फर्जी हाई/लो स्पाइक साफ करें
+            med_close = float(df["close"].median())
+            df = df[(df["close"] > med_close * 0.95) & (df["close"] < med_close * 1.05)]
+            if df.empty or today_open <= 0:
                 return {"ok": False}
 
             df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -291,21 +308,13 @@ def fetch_intraday_vwap_orb(jwt, akey, selected_idx):
             if orb_df.empty:
                 orb_df = df
 
-            today_open = float(df["open"].iloc[0])
-            day_high = float(df["high"].max())
-            day_low = float(df["low"].min())
-            if today_open <= 0:
-                return {"ok": False}
-
             return {
                 "ok": True,
                 "spot": float(df["close"].iloc[-1]),
                 "vwap": round(vwap, 2),
                 "open": today_open,
                 "high": float(orb_df["high"].max()),
-                "low": float(orb_df["low"].min()),
-                "day_high": day_high,
-                "day_low": day_low
+                "low": float(orb_df["low"].min())
             }
     except Exception:
         pass
@@ -468,7 +477,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
         return {
             "decision": "NO_TRADE",
             "score": "0/3",
-            "reason": f"सुबह 9:15 Open ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
+            "reason": f"सुबह 9:15 ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
         }
     if gamma_iv >= 68:
         return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 68) — पैनिक मार्केट।"}
@@ -852,12 +861,14 @@ with pro_tab2:
             slip_mult = 1.0 if pbt_deduct_costs else 0.0
 
             for dt_str, day_df in df.groupby("Date"):
-                morn = day_df[(day_df["Time"] >= "09:15") & (day_df["Time"] <= "09:59")]
-                sess = day_df[(day_df["Time"] >= "10:00") & (day_df["Time"] <= "15:15")]
+                morn = day_df[(day_df["Time"] >= "09:15") & (day_df["Time"] <= "09:59")].copy()
+                sess = day_df[(day_df["Time"] >= "10:00") & (day_df["Time"] <= "15:15")].copy()
                 if len(morn) < 5 or len(sess) < 15:
                     continue
 
-                o915 = float(morn["Open"].iloc[0])
+                fc = float(morn["Close"].iloc[0])
+                fo = float(morn["Open"].iloc[0])
+                o915 = fc if (fc > 0 and abs(fo - fc) / fc > 0.005) else fo
                 h959 = float(morn["High"].max())
                 l959 = float(morn["Low"].min())
                 s1000 = float(sess["Open"].iloc[0])
