@@ -1,4 +1,6 @@
 import math
+import json
+import base64
 from datetime import datetime
 import pytz
 import streamlit as st
@@ -128,9 +130,56 @@ def _ensure_angel_login():
     return None, None
 
 
+def _load_shared_base_oi():
+    """आज का बेस OI (GitHub + Session State) लोड करना ताकि तीनों पेज पर एक ही सटीक Change in OI दिखे"""
+    ist = pytz.timezone("Asia/Kolkata")
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+
+    if st.session_state.get("shared_base_oi_date") != today_str:
+        st.session_state["shared_base_oi_date"] = today_str
+        st.session_state["shared_base_oi_map"] = {}
+        try:
+            token = st.secrets.get("GITHUB_TOKEN", "").strip()
+            repo = st.secrets.get("GITHUB_REPO", "Sarveshbaghel05/algo-trading-app").strip()
+            if token:
+                url = f"https://api.github.com/repos/{repo}/contents/daily_base_oi.json"
+                headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+                res = requests.get(url, headers=headers, timeout=6)
+                if res.status_code == 200:
+                    raw = base64.b64decode(res.json()["content"]).decode("utf-8")
+                    data = json.loads(raw)
+                    if data.get("date") == today_str and isinstance(data.get("oi_map"), dict):
+                        st.session_state["shared_base_oi_map"] = {str(k): int(v) for k, v in data["oi_map"].items()}
+        except Exception:
+            pass
+    return st.session_state["shared_base_oi_map"], today_str
+
+
+def _save_shared_base_oi_to_gh(oi_map, today_str):
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "").strip()
+        repo = st.secrets.get("GITHUB_REPO", "Sarveshbaghel05/algo-trading-app").strip()
+        if not token:
+            return
+        url = f"https://api.github.com/repos/{repo}/contents/daily_base_oi.json"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+        sha = None
+        g_res = requests.get(url, headers=headers, timeout=6)
+        if g_res.status_code == 200:
+            sha = g_res.json().get("sha")
+        payload = {
+            "message": f"Save daily base OI {today_str}",
+            "content": base64.b64encode(json.dumps({"date": today_str, "oi_map": oi_map}).encode("utf-8")).decode("utf-8")
+        }
+        if sha:
+            payload["sha"] = sha
+        requests.put(url, json=payload, headers=headers, timeout=8)
+    except Exception:
+        pass
+
+
 @st.cache_data(ttl=8)
-def _fetch_real_angel_option_chain(jwt_token, api_key, selected_idx):
-    """Angel One SmartAPI से असली Spot, Expiry, Call/Put LTP और Change in OI लाना"""
+def _fetch_real_angel_option_chain_raw(jwt_token, api_key, selected_idx):
     headers = {
         "Authorization": f"Bearer {jwt_token}",
         "Content-Type": "application/json",
@@ -187,8 +236,8 @@ def _fetch_real_angel_option_chain(jwt_token, api_key, selected_idx):
         exp_df["clean_strike"] = (exp_df["strike"].astype(float) / 100.0).astype(int)
         exp_df["opt_type"] = exp_df["symbol"].str[-2:]
 
-        min_s = atm_strike - (4 * step)
-        max_s = atm_strike + (4 * step)
+        min_s = atm_strike - (5 * step)
+        max_s = atm_strike + (5 * step)
         target_df = exp_df[(exp_df["clean_strike"] >= min_s) & (exp_df["clean_strike"] <= max_s)].copy()
         tokens = target_df["token"].astype(str).tolist()
         if not tokens:
@@ -214,20 +263,56 @@ def _fetch_real_angel_option_chain(jwt_token, api_key, selected_idx):
 
         rows = []
         for st_val in sorted(target_df["clean_strike"].unique()):
-            ce_q = fetched_map.get(contract_map.get((st_val, "CE"), ""), {})
-            pe_q = fetched_map.get(contract_map.get((st_val, "PE"), ""), {})
+            ce_tok = contract_map.get((st_val, "CE"), "")
+            pe_tok = contract_map.get((st_val, "PE"), "")
+            ce_q = fetched_map.get(ce_tok, {})
+            pe_q = fetched_map.get(pe_tok, {})
             rows.append({
+                "CE_TOKEN": ce_tok,
+                "PE_TOKEN": pe_tok,
                 "STRIKE": st_val,
                 "CALL LTP": float(ce_q.get("ltp", 0.0) or 0.0),
                 "PUT LTP": float(pe_q.get("ltp", 0.0) or 0.0),
                 "CALL OI": int(float(ce_q.get("opnInterest", 0) or 0)),
                 "PUT OI": int(float(pe_q.get("opnInterest", 0) or 0)),
-                "CALL CHG OI": int(float(ce_q.get("netChangeOpnInterest", 0) or 0)),
-                "PUT CHG OI": int(float(pe_q.get("netChangeOpnInterest", 0) or 0)),
             })
         return pd.DataFrame(rows), spot_price, exp_str
     except Exception:
         return None, spot_price, "Simulation"
+
+
+def _fetch_real_angel_option_chain(jwt_token, api_key, selected_idx):
+    """Angel One SmartAPI से असली Spot, Expiry, Call/Put LTP और सटीक Change in OI लाना"""
+    raw_df, spot_price, exp_str = _fetch_real_angel_option_chain_raw(jwt_token, api_key, selected_idx)
+    if raw_df is None or raw_df.empty:
+        return raw_df, spot_price, exp_str
+
+    base_map, today_str = _load_shared_base_oi()
+    updated_base = False
+    df = raw_df.copy()
+    ce_chgs, pe_chgs = [], []
+
+    for _, r in df.iterrows():
+        c_tok, p_tok = r["CE_TOKEN"], r["PE_TOKEN"]
+        c_oi, p_oi = int(r["CALL OI"]), int(r["PUT OI"])
+
+        if c_tok and c_oi > 0 and c_tok not in base_map:
+            base_map[c_tok] = c_oi
+            updated_base = True
+        if p_tok and p_oi > 0 and p_tok not in base_map:
+            base_map[p_tok] = p_oi
+            updated_base = True
+
+        ce_chgs.append((c_oi - base_map[c_tok]) if (c_tok in base_map and c_oi > 0) else 0)
+        pe_chgs.append((p_oi - base_map[p_tok]) if (p_tok in base_map and p_oi > 0) else 0)
+
+    if updated_base:
+        st.session_state["shared_base_oi_map"] = base_map
+        _save_shared_base_oi_to_gh(base_map, today_str)
+
+    df["CALL CHG OI"] = ce_chgs
+    df["PUT CHG OI"] = pe_chgs
+    return df[["STRIKE", "CALL LTP", "PUT LTP", "CALL OI", "PUT OI", "CALL CHG OI", "PUT CHG OI"]], spot_price, exp_str
 
 
 def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simulation"):
@@ -236,9 +321,9 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
     बाज़ार का साफ़ फैसला देता है।
     """
     step_map = {"Nifty 50": 50, "Bank Nifty": 100, "Sensex": 100}
-    hedge_map = {"Nifty 50": 300, "Bank Nifty": 300, "Sensex": 1000}
+    hedge_map = {"Nifty 50": 500, "Bank Nifty": 1000, "Sensex": 1500}
     step = step_map.get(selected_idx, 50)
-    hedge_pts = hedge_map.get(selected_idx, 300)
+    hedge_pts = hedge_map.get(selected_idx, 500)
     atm_strike = round(spot_price / step) * step
 
     atm_row = full_df[full_df["STRIKE"] == atm_strike]
@@ -251,6 +336,7 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
             "border_color": "#64748b",
             "efficiency_score": 0.0,
             "gamma_iv_risk": 0.0,
+            "gamma_iv_score": 0.0,
             "atm_theta": 0.0,
             "net_delta": 0.0,
             "atm_iv": 0.0,
@@ -364,10 +450,7 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
         sub_headline = f"Theta गलन तेज़ है (₹{total_daily_theta}/दिन) और Gamma-IV शांत है ({gamma_iv_risk}/100) — बाज़ार एक दायरे में रहेगा"
         bg_color = "linear-gradient(90deg, #78350f, #451a03)"
         border_color = "#f59e0b"
-        if dn_put_chg >= up_call_chg:
-            trade_plan = f"क्या करें: बाज़ार शांत है — {atm_strike} PE बेचें + {atm_strike - hedge_pts} PE हेज खरीदें और Theta का लाभ लें।"
-        else:
-            trade_plan = f"क्या करें: बाज़ार शांत है — {atm_strike} CE बेचें + {atm_strike + hedge_pts} CE हेज खरीदें और Theta का लाभ लें।"
+        trade_plan = f"क्या करें: बाज़ार शांत है — {atm_strike} CE+PE Straddle बेचें + {atm_strike + hedge_pts} CE और {atm_strike - hedge_pts} PE हेज खरीदें।"
 
     return {
         "direction": direction,
@@ -377,6 +460,7 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Simula
         "border_color": border_color,
         "efficiency_score": theta_delta_eff,
         "gamma_iv_risk": gamma_iv_risk,
+        "gamma_iv_score": gamma_iv_risk,
         "atm_theta": total_daily_theta,
         "net_delta": net_delta,
         "atm_iv": avg_iv_pct,
