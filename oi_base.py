@@ -23,7 +23,6 @@ _MEM_CACHE = {}
 
 
 def _get_secret(key_name, default_val=""):
-    # पहले Streamlit secrets देखें, न मिले तो Render/OS Environment Variables देखें
     try:
         if st is not None and key_name in st.secrets:
             return str(st.secrets[key_name]).strip()
@@ -32,9 +31,6 @@ def _get_secret(key_name, default_val=""):
     return str(os.environ.get(key_name, default_val)).strip()
 
 
-# ==========================================
-# 1. GitHub Storage Helpers (1MB+ Safe)
-# ==========================================
 def get_gh_config():
     token = _get_secret("GITHUB_TOKEN", "")
     repo = _get_secret("GITHUB_REPO", DEFAULT_GH_REPO) or DEFAULT_GH_REPO
@@ -104,11 +100,7 @@ def gh_write_json(filepath, data_obj, commit_msg):
     return gh_write_text(filepath, json.dumps(data_obj, ensure_ascii=False, indent=2), commit_msg)
 
 
-# ==========================================
-# 2. Persistent Settings (Multi-Index Nifty + Sensex)
-# ==========================================
 def load_algo_settings(force_refresh=False):
-    """तीनों रणनीतियों के टॉगल, इंडेक्स लिस्ट और दैनिक लॉक लोड करना"""
     defaults = {
         "main_auto_10am": False,
         "main_indices": ["Nifty 50", "Sensex"],
@@ -123,7 +115,6 @@ def load_algo_settings(force_refresh=False):
         "traded_dates": {},
         "last_tg_update_id": 0,
     }
-
     now_ts = time.time()
     cache_age = now_ts - _MEM_CACHE.get("settings_ts", 0)
     if not force_refresh and "settings_obj" in _MEM_CACHE and cache_age < 20:
@@ -152,7 +143,6 @@ def save_algo_settings(cfg):
 
 
 def update_algo_settings_batch(updates_dict):
-    """केवल तभी GitHub पर सेव करें जब सचमुच कोई मान बदला हो"""
     cfg = load_algo_settings()
     changed = False
     for k, v in updates_dict.items():
@@ -197,9 +187,6 @@ def save_tg_offset(new_offset):
         save_algo_settings(cfg)
 
 
-# ==========================================
-# 3. Angel One Auto-Login & Scrip Master
-# ==========================================
 def ensure_angel_session(force_relogin=False):
     now_ts = time.time()
     if not force_relogin and "angel_jwt" in _MEM_CACHE and (now_ts - _MEM_CACHE.get("angel_login_ts", 0)) < 14400:
@@ -281,9 +268,6 @@ def get_index_meta(selected_idx):
     return out
 
 
-# ==========================================
-# 4. सही Expiry और DTE (छुट्टियों सहित)
-# ==========================================
 def get_live_expiry_info(selected_idx):
     meta = get_index_meta(selected_idx)
     ist = pytz.timezone("Asia/Kolkata")
@@ -378,9 +362,6 @@ def build_backtest_dte_map(sorted_trading_dates, selected_idx):
     return dte_map
 
 
-# ==========================================
-# 5. सटीक Change in OI इंजन (तुरंत सेविंग सहित)
-# ==========================================
 def _load_eod_oi_store():
     if "eod_oi_store" in _MEM_CACHE:
         return _MEM_CACHE["eod_oi_store"]
@@ -494,7 +475,6 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
             ce_chgs.append(0)
             pe_chgs.append(0)
 
-    # पहली बार तुरंत सेव हो (0 सेकंड देरी), उसके बाद हर 5 मिनट पर अपडेट हो
     last_eod_save_ts = _MEM_CACHE.get("last_eod_save_ts", 0)
     if need_save_eod and (last_eod_save_ts == 0 or (time.time() - last_eod_save_ts >= 300)):
         today_entry["time"] = now_time_str
