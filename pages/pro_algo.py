@@ -15,6 +15,7 @@ from oi_base import (
     get_scrip_master_df,
     get_index_meta,
     get_live_expiry_info,
+    get_exact_t_years,
     build_backtest_dte_map,
     compute_accurate_chg_oi,
     load_algo_settings,
@@ -27,10 +28,93 @@ from oi_base import (
     gh_write_text,
 )
 
-try:
-    from pages.greek_regime_indicator import evaluate_greeks_regime
-except ImportError:
-    from greek_regime_indicator import evaluate_greeks_regime
+
+# ==========================================
+# Built-in Safe Fallback (ताकि कभी ModuleNotFoundError न आए)
+# ==========================================
+def _pro_norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _pro_norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _pro_iv(option_price, spot, strike, t_years, opt_type="CE"):
+    if option_price <= 0.5 or t_years <= 1e-6 or spot <= 0 or strike <= 0:
+        return 0.14
+    intrinsic = max(0.0, spot - strike) if opt_type == "CE" else max(0.0, strike - spot)
+    if option_price <= intrinsic + 0.2:
+        return 0.08
+    low, high, r = 0.02, 2.00, 0.065
+    for _ in range(35):
+        mid = 0.5 * (low + high)
+        d1 = (math.log(spot / strike) + (r + 0.5 * mid * mid) * t_years) / (mid * math.sqrt(t_years))
+        d2 = d1 - mid * math.sqrt(t_years)
+        px = (spot * _pro_norm_cdf(d1) - strike * math.exp(-r * t_years) * _pro_norm_cdf(d2)) if opt_type == "CE" else (strike * math.exp(-r * t_years) * _pro_norm_cdf(-d2) - spot * _pro_norm_cdf(-d1))
+        if px > option_price:
+            high = mid
+        else:
+            low = mid
+    return round(0.5 * (low + high), 4)
+
+
+def _builtin_pro_greeks(selected_idx, spot_price, full_df, expiry_str="Unknown", oi_valid=True):
+    meta = get_index_meta(selected_idx)
+    step, hedge_pts = meta["step"], meta["hedge"]
+    atm_strike = round(spot_price / step) * step
+    if full_df is None or full_df.empty or expiry_str in ["Unknown", "Simulation", "DEMO"] or not oi_valid:
+        return {
+            "direction": "WAIT", "headline": "⏳ असली डेटा व क्लोज़िंग OI की प्रतीक्षा (WAIT)",
+            "gamma_iv_risk": 0.0, "gamma_iv_score": 0.0, "trade_plan": "प्रतीक्षा करें।"
+        }
+    atm_row = full_df[full_df["STRIKE"] == atm_strike]
+    if atm_row.empty:
+        return {
+            "direction": "WAIT", "headline": "⏳ ATM डेटा लोड हो रहा है...",
+            "gamma_iv_risk": 0.0, "gamma_iv_score": 0.0, "trade_plan": "प्रतीक्षा करें।"
+        }
+    t_years = max(get_exact_t_years(expiry_str), 1.0 / (365.0 * 24.0))
+    ce_iv = max(_pro_iv(float(atm_row["CALL LTP"].iloc[0]), spot_price, atm_strike, t_years, "CE"), 0.05)
+    pe_iv = max(_pro_iv(float(atm_row["PUT LTP"].iloc[0]), spot_price, atm_strike, t_years, "PE"), 0.05)
+    r = 0.065
+    d1_c = (math.log(spot_price / atm_strike) + (r + 0.5 * ce_iv * ce_iv) * t_years) / (ce_iv * math.sqrt(t_years))
+    d1_p = (math.log(spot_price / atm_strike) + (r + 0.5 * pe_iv * pe_iv) * t_years) / (pe_iv * math.sqrt(t_years))
+    net_delta = round(_pro_norm_cdf(d1_c) + (_pro_norm_cdf(d1_p) - 1.0), 3)
+    avg_gamma = ((_pro_norm_pdf(d1_c) / (spot_price * ce_iv * math.sqrt(t_years))) + (_pro_norm_pdf(d1_p) / (spot_price * pe_iv * math.sqrt(t_years)))) / 2.0
+    avg_iv_pct = ((ce_iv + pe_iv) / 2.0) * 100.0
+    gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
+
+    if gamma_iv_risk >= 65.0:
+        return {
+            "direction": "WAIT", "headline": "🚨 अत्यधिक Gamma-IV खतरा — ट्रेड से बचें",
+            "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk, "trade_plan": "नई सेलिंग से बचें।"
+        }
+
+    up_3 = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3 * step)]
+    dn_3 = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3 * step)]
+    up_ce = int(up_3["CALL CHG OI"].sum()) if not up_3.empty else 0
+    dn_pe = int(dn_3["PUT CHG OI"].sum()) if not dn_3.empty else 0
+
+    bull_pts = (2 if (dn_pe > 0 and dn_pe >= up_ce * 1.25) else 0) + (1 if net_delta >= 0.06 else 0)
+    bear_pts = (2 if (up_ce > 0 and up_ce >= dn_pe * 1.25) else 0) + (1 if net_delta <= -0.06 else 0)
+
+    if bull_pts >= 2 and bull_pts > bear_pts:
+        return {"direction": "UP", "headline": "🟢 BULLISH", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
+    elif bear_pts >= 2 and bear_pts > bull_pts:
+        return {"direction": "DOWN", "headline": "🔴 BEARISH", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
+    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 50.0 and abs(net_delta) < 0.08:
+        return {"direction": "SIDEWAYS", "headline": "🟡 SIDEWAYS", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
+    return {"direction": "WAIT", "headline": "⏳ WAIT", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
+
+
+evaluate_greeks_regime = _builtin_pro_greeks
+for _m in ["pages.greek_regime_indicator", "pages.greeks_regime_indicator", "greek_regime_indicator", "greeks_regime_indicator"]:
+    try:
+        evaluate_greeks_regime = getattr(__import__(_m, fromlist=["evaluate_greeks_regime"]), "evaluate_greeks_regime")
+        break
+    except Exception:
+        continue
 
 PRO_HISTORY_FILE = "pro_algo_history.csv"
 PRO_ACTIVE_FILE = "pro_active_trade.json"
