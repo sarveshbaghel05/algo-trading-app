@@ -19,7 +19,7 @@ from oi_base import (
     build_backtest_dte_map,
     compute_accurate_chg_oi,
     load_algo_settings,
-    set_toggle_setting,
+    update_algo_settings_batch,
     is_strategy_traded_today,
     mark_strategy_traded_today,
     get_saved_tg_offset,
@@ -32,7 +32,7 @@ st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 
 
 # ==========================================
-# Built-in Safe Fallbacks (सही Gamma-IV स्केल के साथ)
+# Safe Fallbacks + असली इंडिकेटर फ़ाइलों का जुड़ाव
 # ==========================================
 def _builtin_norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -62,9 +62,8 @@ def _builtin_iv(option_price, spot, strike, t_years, opt_type="CE"):
 
 
 def _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_decimal):
-    """0-100 स्केल पर सटीक Gamma-IV स्कोर (सामान्य दिन: 20-45, तेज़ हलचल: 50-65, पैनिक: 65+)"""
     one_pct_move = spot_price * 0.01
-    delta_shift_1pct = avg_gamma * one_pct_move  # 1% चाल पर Delta में बदलाव (सामान्यतः 0.15 से 0.45)
+    delta_shift_1pct = avg_gamma * one_pct_move
     raw_score = (delta_shift_1pct * 95.0) + (avg_iv_decimal * 65.0)
     return round(min(100.0, max(5.0, raw_score)), 1)
 
@@ -89,7 +88,6 @@ def _builtin_evaluate_otm_iv(selected_idx, spot_price, full_df, expiry_label, oi
     avg_ce = round(sum(ce_ivs) / len(ce_ivs), 2) if ce_ivs else 0.0
     avg_pe = round(sum(pe_ivs) / len(pe_ivs), 2) if pe_ivs else 0.0
     skew = round(avg_pe - avg_ce, 2)
-
     if bot3_pe_chg > 0 and bot3_pe_chg >= top3_ce_chg * 1.20:
         return {
             "signal": "BUY_SIGNAL", "spread_name": "BULL PUT SPREAD (मजबूत अपट्रेंड)",
@@ -139,8 +137,7 @@ def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unkn
     d1_p = (math.log(spot_price / atm_strike) + (r + 0.5 * pe_iv * pe_iv) * t_years) / (pe_iv * math.sqrt(t_years))
     net_delta = round(_builtin_norm_cdf(d1_c) + (_builtin_norm_cdf(d1_p) - 1.0), 3)
     avg_gamma = ((_builtin_norm_pdf(d1_c) / (spot_price * ce_iv * math.sqrt(t_years))) + (_builtin_norm_pdf(d1_p) / (spot_price * pe_iv * math.sqrt(t_years)))) / 2.0
-    avg_iv_dec = (ce_iv + pe_iv) / 2.0
-    gamma_iv_risk = _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_dec)
+    gamma_iv_risk = _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, (ce_iv + pe_iv) / 2.0)
 
     if gamma_iv_risk >= 68.0:
         return {
@@ -188,7 +185,20 @@ def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unkn
 
 
 evaluate_otm_iv_from_df = _builtin_evaluate_otm_iv
+for _m in ["pages.otm_iv_indicator", "otm_iv_indicator"]:
+    try:
+        evaluate_otm_iv_from_df = getattr(__import__(_m, fromlist=["evaluate_otm_iv_from_df"]), "evaluate_otm_iv_from_df")
+        break
+    except Exception:
+        continue
+
 evaluate_greeks_regime = _builtin_evaluate_greeks
+for _m in ["pages.greek_regime_indicator", "pages.greeks_regime_indicator", "greek_regime_indicator", "greeks_regime_indicator"]:
+    try:
+        evaluate_greeks_regime = getattr(__import__(_m, fromlist=["evaluate_greeks_regime"]), "evaluate_greeks_regime")
+        break
+    except Exception:
+        continue
 
 
 # ==========================================
@@ -382,6 +392,7 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
 
 
 def record_daily_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
+    """हर मिनट का डेटा अलग दैनिक CSV में स्थायी सेव करें"""
     try:
         ist = pytz.timezone("Asia/Kolkata")
         now_ist = datetime.now(ist)
@@ -406,7 +417,7 @@ def record_daily_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
         save_df.to_csv(day_file, mode="a", header=write_hdr, index=False)
         st.session_state["last_rec_min_key"] = min_key
 
-        if time.time() - st.session_state.get("last_oc_sync_ts", 0) >= 900:
+        if time.time() - st.session_state.get("last_oc_sync_ts", 0) >= 600:
             with open(day_file, "r", encoding="utf-8") as f:
                 gh_write_text(f"oc_logs/{day_file}", f.read(), f"Sync OC log {today_str}")
             st.session_state["last_oc_sync_ts"] = time.time()
@@ -428,139 +439,10 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
 
 # ==========================================
-# Background Multi-Strategy Paper Auto-Runner
-# ==========================================
-def run_background_paper_engines(jwt, akey):
-    if not jwt or not akey:
-        return
-    ist = pytz.timezone("Asia/Kolkata")
-    now_ist = datetime.now(ist)
-    if now_ist.weekday() >= 5:
-        return
-    curr_mins = now_ist.hour * 60 + now_ist.minute
-    if curr_mins < (9 * 60 + 15) or curr_mins > (15 * 60 + 25):
-        return
-
-    if time.time() - st.session_state.get("bg_runner_last_ts", 0) < 12:
-        return
-    st.session_state["bg_runner_last_ts"] = time.time()
-
-    cfg = load_algo_settings()
-    today_str = now_ist.strftime("%Y-%m-%d")
-    now_str = now_ist.strftime("%I:%M:%S %p")
-
-    if cfg.get("main_auto_10am") and not is_strategy_traded_today("main", today_str):
-        if now_ist.hour == 10 and now_ist.minute <= 3:
-            raw_act, _, _ = gh_read_text("active_trade_state.json")
-            has_act = bool(raw_act and len(raw_act.strip()) > 5 and raw_act.strip() != "{}")
-            if not has_act:
-                sel_idx = st.session_state.get("algo_idx", "Nifty 50")
-                lots_cnt = int(st.session_state.get("algo_lots", 1))
-                meta = get_index_meta(sel_idx)
-                df_oc, spot, exp_s, _, cmap, oi_ok, _, _ = fetch_angel_live_oc(jwt, akey, sel_idx, 5)
-                if df_oc is not None and oi_ok and spot:
-                    g_inf = evaluate_greeks_regime(sel_idx, spot, df_oc, exp_s, oi_valid=True)
-                    m_dir = g_inf.get("direction", "WAIT")
-                    if m_dir in ["UP", "DOWN", "SIDEWAYS"]:
-                        atm = round(spot / meta["step"]) * meta["step"]
-                        s_name, s_sum, legs, _ = build_strategy_plan(m_dir, sel_idx, atm, meta["hedge"], df_oc)
-                        execute_multi_leg_entry(
-                            "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)", sel_idx, s_name, s_sum,
-                            legs, lots_cnt, meta["lot"], cmap, trigger_src="Auto 10:00 AM (Background)"
-                        )
-                        mark_strategy_traded_today("main", today_str)
-
-    if cfg.get("ema_auto_arm") and not is_strategy_traded_today("ema", today_str):
-        if (9 * 60 + 45) <= curr_mins <= (12 * 60):
-            try:
-                from pages.ema16_oi_algo import (
-                    ema_fetch_intraday_candles,
-                    evaluate_ema16_oi_setup,
-                    pick_40_delta_spread,
-                    ema_load_active,
-                    ema_save_active,
-                )
-                if not ema_load_active():
-                    e_idx = st.session_state.get("ema_idx_sel", "Nifty 50")
-                    e_tf = 5 if "5" in st.session_state.get("ema_tf_sel", "5 Minute") else 3
-                    e_lots = int(st.session_state.get("ema_lots_sel", 1))
-                    meta = get_index_meta(e_idx)
-                    df_oc, spot, exp_s, dte_v, cmap, oi_ok, _, _ = fetch_angel_live_oc(jwt, akey, e_idx, 6)
-                    c_df = ema_fetch_intraday_candles(jwt, akey, e_idx, e_tf, days_back=3)
-                    if df_oc is not None and oi_ok and not c_df.empty and spot:
-                        df_oc_dte = df_oc.copy()
-                        df_oc_dte["DTE"] = max(0.2, float(dte_v))
-                        setup = evaluate_ema16_oi_setup(c_df, spot, df_oc_dte, e_idx, e_tf, oi_valid=True)
-                        if setup["signal"] in ["BULLISH", "BEARISH"]:
-                            s_nm, s_sm, p_lgs, _ = pick_40_delta_spread(setup["signal"], e_idx, spot, df_oc_dte)
-                            total_q = meta["lot"] * e_lots
-                            ordered = [x for x in p_lgs if x["action"] == "BUY"] + [x for x in p_lgs if x["action"] == "SELL"]
-                            for lg in ordered:
-                                ci = cmap.get((lg["strike"], lg["side"]), {"symbol": "", "token": "0", "exch": meta["opt_exch"]})
-                                lg.update({"symbol": ci["symbol"], "token": ci["token"], "exch": ci["exch"]})
-                            new_tr = {
-                                "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)", "index": e_idx, "tf": f"{e_tf}m",
-                                "direction": setup["signal"], "strategy": s_nm, "summary": s_sm,
-                                "lots": e_lots, "qty": total_q, "exch": meta["opt_exch"],
-                                "legs": ordered, "entry_time": now_str, "sl_rs": -1700.0 * e_lots, "tsl_active": False
-                            }
-                            ema_save_active(new_tr)
-                            st.session_state["ema_active_trade"] = new_tr
-                            mark_strategy_traded_today("ema", today_str)
-                            send_telegram_alert(f"🚀 <b>16 EMA PAPER AUTO-ENTRY ({e_idx})</b>\n{s_sm}\nTime: {now_str}")
-            except Exception:
-                pass
-
-    if cfg.get("pro_auto") and not is_strategy_traded_today("pro", today_str):
-        if now_ist.hour == 10 and now_ist.minute <= 3:
-            try:
-                from pages.pro_algo import (
-                    fetch_intraday_vwap_orb,
-                    run_4layer_decision_engine,
-                    build_pro_legs,
-                    load_pro_active,
-                    save_pro_active,
-                )
-                if not load_pro_active():
-                    p_idx = st.session_state.get("pro_idx", "Nifty 50")
-                    p_lots = int(st.session_state.get("pro_lots", 1))
-                    meta = get_index_meta(p_idx)
-                    df_oc, spot, exp_s, dte_v, cmap, oi_ok, _, _ = fetch_angel_live_oc(jwt, akey, p_idx, 6)
-                    if df_oc is not None and oi_ok and spot:
-                        orb_d = fetch_intraday_vwap_orb(jwt, akey, p_idx, spot)
-                        g_inf = evaluate_greeks_regime(p_idx, spot, df_oc, exp_s, oi_valid=True)
-                        c_data = {
-                            "df": df_oc, "spot": spot, "atm": round(spot / meta["step"]) * meta["step"],
-                            "exp_str": exp_s, "dte": dte_v, "cmap": cmap, "info": meta, "oi_valid": True
-                        }
-                        verdict = run_4layer_decision_engine(c_data, orb_d, g_inf)
-                        if verdict["decision"] in ["UP", "DOWN", "SIDEWAYS"]:
-                            s_nm, p_lgs, net_cr = build_pro_legs(verdict["decision"], c_data)
-                            total_q = meta["lot"] * p_lots
-                            max_cr_rs = round(net_cr * total_q, 0)
-                            hard_sl = max(1200.0 * p_lots, round(max_cr_rs * 0.38, 0))
-                            ordered = [x for x in p_lgs if x["action"] == "BUY"] + [x for x in p_lgs if x["action"] == "SELL"]
-                            for lg in ordered:
-                                ci = cmap.get((lg["strike"], lg["side"]), {"symbol": "", "token": "0"})
-                                lg["symbol"], lg["token"] = ci["symbol"], ci["token"]
-                            new_pro = {
-                                "mode": "🟡 Paper Trading", "index": p_idx, "strategy": s_nm, "score": verdict["score"],
-                                "lots": p_lots, "qty": total_q, "exch": meta["opt_exch"], "legs": ordered,
-                                "entry_time": now_str, "max_credit_rs": max_cr_rs, "hard_sl_rs": hard_sl, "profit_locked": False
-                            }
-                            save_pro_active(new_pro)
-                            st.session_state["pro_active"] = new_pro
-                            mark_strategy_traded_today("pro", today_str)
-                            send_telegram_alert(f"🚀 <b>PRO ALGO PAPER AUTO-ENTRY ({p_idx})</b>\n{s_nm}\nTime: {now_str}")
-            except Exception:
-                pass
-
-
-# ==========================================
-# Persistent Trade History & Active Trade
+# Persistent Trade History & Multi-Index Active Trades
 # ==========================================
 HISTORY_FILE = "paper_trades_history.csv"
-ACTIVE_TRADE_FILE = "active_trade_state.json"
+ACTIVE_TRADES_MULTI_FILE = "active_trades_multi.json"
 
 
 def load_trade_history():
@@ -590,21 +472,21 @@ def save_trade_history(history_list):
     st.session_state["gh_sync_status"] = f"☁️ {msg}" if ok else f"⚠️ {msg}"
 
 
-def load_active_trade():
-    raw_json, _, status = gh_read_text(ACTIVE_TRADE_FILE)
+def load_multi_active_trades():
+    """प्रत्येक इंडेक्स (Nifty 50, Sensex, Bank Nifty) की अलग चालू पोजीशन लोड करें"""
+    raw_json, _, status = gh_read_text(ACTIVE_TRADES_MULTI_FILE)
     if status == "OK" and raw_json:
         try:
             data = json.loads(raw_json)
-            if isinstance(data, dict) and (data.get("legs") or data.get("sell_strike")):
+            if isinstance(data, dict):
                 return data
         except Exception:
             pass
-    return None
+    return {}
 
 
-def save_active_trade(trade_dict):
-    text_data = json.dumps(trade_dict if trade_dict else {}, ensure_ascii=False)
-    gh_write_text(ACTIVE_TRADE_FILE, text_data, "Update active trade state")
+def save_multi_active_trades(trades_map):
+    gh_write_text(ACTIVE_TRADES_MULTI_FILE, json.dumps(trades_map or {}, ensure_ascii=False, indent=2), "Update active multi-index trades")
 
 
 def build_strategy_plan(direction, selected_idx, atm_strike, hedge_pts, full_df):
@@ -651,7 +533,7 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
     exch = "BFO" if selected_idx == "Sensex" else "NFO"
 
     if any(float(lg.get("entry_ltp", 0)) <= 0 for lg in legs):
-        return False, "किसी स्ट्राइक का लाइव भाव (LTP) 0 आ रहा है — सुरक्षा हेतु एंट्री रोकी गई।"
+        return False, f"{selected_idx}: किसी स्ट्राइक का लाइव भाव (LTP) 0 आ रहा है — एंट्री रोकी गई।"
 
     enriched_legs = []
     for lg in legs:
@@ -688,8 +570,10 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
         "lots": lots, "qty": total_qty, "exch": exch, "legs": ordered_legs,
         "entry_time": now_str, "sl_rs": sl_limit
     }
-    st.session_state["active_trade"] = new_trade
-    save_active_trade(new_trade)
+    trades_map = st.session_state.get("active_trades_map", {})
+    trades_map[selected_idx] = new_trade
+    st.session_state["active_trades_map"] = trades_map
+    save_multi_active_trades(trades_map)
 
     mode_tag = "🟡 PAPER TRADE" if "PAPER" in mode else "🔴 LIVE ALGO TRADE"
     legs_lines = "\n".join([f"• <b>{l['action']}</b> {l['strike']} {l['side']} @ ₹{l['entry_ltp']}" for l in ordered_legs])
@@ -698,11 +582,12 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
         f"🧭 <b>Strategy:</b> {strat_name}\n{legs_lines}\n📦 <b>Qty:</b> {lots} Lot ({total_qty} Qty)\n"
         f"🛑 <b>Auto SL:</b> -₹{int(sl_limit):,} | ⏰ {now_str}"
     )
-    return True, f"सफल! {strat_name} एग्जीक्यूट हो गया।"
+    return True, f"सफल! {selected_idx} में {strat_name} लग गया।"
 
 
-def close_active_trade(curr_ltp_by_idx, reason="Manual Exit"):
-    tr = st.session_state.get("active_trade")
+def close_index_trade(idx_name, curr_ltp_by_idx, reason="Manual Exit"):
+    trades_map = st.session_state.get("active_trades_map", {})
+    tr = trades_map.get(idx_name)
     if not tr:
         return False
 
@@ -714,20 +599,16 @@ def close_active_trade(curr_ltp_by_idx, reason="Manual Exit"):
     if "LIVE ALGO" in tr["mode"]:
         jwt, akey = ensure_angel_session()
         if not jwt:
-            send_telegram_alert("🚨 <b>EXIT FAILED:</b> Angel One सत्र समाप्त है, कृपया तुरंत मैनुअल स्क्वेयर-ऑफ करें!")
+            send_telegram_alert(f"🚨 <b>EXIT FAILED ({idx_name}):</b> Angel One सत्र समाप्त है!")
             return False
-        sell_legs = [l for l in legs if l["action"] == "SELL"]
-        buy_legs = [l for l in legs if l["action"] == "BUY"]
-        for lg in sell_legs:
+        for lg in [l for l in legs if l["action"] == "SELL"]:
             ok_x, err_x = place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], "BUY", tr["qty"])
             if not ok_x:
-                send_telegram_alert(f"🚨 <b>CRITICAL EXIT FAILED ({lg['symbol']}):</b> {err_x} — तुरंत ब्रोकर ऐप से बंद करें!")
+                send_telegram_alert(f"🚨 <b>CRITICAL EXIT FAILED ({lg['symbol']}):</b> {err_x}")
                 return False
             time.sleep(0.35)
-        for lg in buy_legs:
-            ok_x, err_x = place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], "SELL", tr["qty"])
-            if not ok_x:
-                send_telegram_alert(f"⚠️ <b>HEDGE EXIT FAILED ({lg['symbol']}):</b> {err_x}")
+        for lg in [l for l in legs if l["action"] == "BUY"]:
+            place_angel_order(jwt, akey, lg["exch"], lg["symbol"], lg["token"], "SELL", tr["qty"])
             time.sleep(0.35)
 
     pnl_pts = 0.0
@@ -741,27 +622,244 @@ def close_active_trade(curr_ltp_by_idx, reason="Manual Exit"):
 
     mode_short = "Paper" if "PAPER" in tr["mode"] else "LIVE"
     st.session_state["trade_history"].insert(0, {
-        "तारीख": today_str, "मोड": mode_short, "इंडेक्स": tr["index"],
+        "तारीख": today_str, "मोड": mode_short, "इंडेक्स": idx_name,
         "स्प्रेड": tr.get("summary", tr.get("strategy", "Spread")),
         "लॉट": tr["lots"], "एंट्री समय": tr["entry_time"], "एग्जिट समय": exit_time,
         "कारण": reason, "लाभ / हानि (₹)": pnl_rs
     })
     save_trade_history(st.session_state["trade_history"])
-    save_active_trade(None)
-    st.session_state["active_trade"] = None
+    del trades_map[idx_name]
+    st.session_state["active_trades_map"] = trades_map
+    save_multi_active_trades(trades_map)
 
     send_telegram_alert(
-        f"🏁 <b>TRADE CLOSED ({mode_short})</b>\n📊 <b>Index:</b> {tr['index']}\n"
+        f"🏁 <b>TRADE CLOSED ({mode_short} - {idx_name})</b>\n"
         f"📝 <b>Reason:</b> {reason}\n💵 <b>Final P&L:</b> <b>₹{pnl_rs:+,.0f}</b> | ⏰ {exit_time}"
     )
     return True
 
 
 # ==========================================
+# Full Background Multi-Index & Multi-Strategy Engine
+# (तीनों इंडेक्स की डेटा रिकॉर्डिंग + सभी रणनीतियों की एंट्री और SL/एग्जिट)
+# ==========================================
+def run_full_background_engines(jwt, akey):
+    if not jwt or not akey:
+        return
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    if now_ist.weekday() >= 5:
+        return
+    curr_mins = now_ist.hour * 60 + now_ist.minute
+    if curr_mins < (9 * 60 + 15) or curr_mins > (15 * 60 + 30):
+        return
+
+    if time.time() - st.session_state.get("bg_runner_last_ts", 0) < 12:
+        return
+    st.session_state["bg_runner_last_ts"] = time.time()
+
+    cfg = load_algo_settings()
+    today_str = now_ist.strftime("%Y-%m-%d")
+    now_str = now_ist.strftime("%I:%M:%S %p")
+
+    # 1. तीनों इंडेक्स का लाइव डेटा लाएं और हर मिनट स्थायी सेव करें
+    live_chains = {}
+    for idx_nm in ["Nifty 50", "Bank Nifty", "Sensex"]:
+        df_oc, spot, exp_s, dte_v, cmap, oi_ok, _, _ = fetch_angel_live_oc(jwt, akey, idx_nm, 5)
+        if df_oc is not None and not df_oc.empty and spot:
+            live_chains[idx_nm] = {
+                "df": df_oc, "spot": spot, "exp_str": exp_s,
+                "dte": dte_v, "cmap": cmap, "oi_valid": oi_ok, "info": get_index_meta(idx_nm)
+            }
+
+    # 2. Main Terminal: सक्रिय ट्रेडों के SL/Exit जाँचें + 10:00 AM ऑटो-एंट्री (Nifty + Sensex दोनों में)
+    trades_map = st.session_state.get("active_trades_map", {})
+    for idx_nm in list(trades_map.keys()):
+        tr = trades_map[idx_nm]
+        legs = tr.get("legs", [])
+        toks = tuple(l["token"] for l in legs if l.get("token") and l["token"] != "0")
+        ltp_m = get_live_ltp_for_tokens(jwt, akey, tr["exch"], toks) if toks else {}
+        cur_pxs = {}
+        pts = 0.0
+        for i, lg in enumerate(legs):
+            px = ltp_m.get(lg["token"], lg.get("last_valid_ltp", lg["entry_ltp"]))
+            if px > 0:
+                lg["last_valid_ltp"] = px
+            else:
+                px = float(lg.get("last_valid_ltp", lg["entry_ltp"]))
+            cur_pxs[i] = px
+            pts += (lg["entry_ltp"] - px) if lg["action"] == "SELL" else (px - lg["entry_ltp"])
+        mtm_rs = pts * tr["qty"]
+        if mtm_rs <= -tr["sl_rs"]:
+            close_index_trade(idx_nm, cur_pxs, reason=f"Auto SL Hit (-₹{int(tr['sl_rs'])})")
+        elif curr_mins >= (15 * 60 + 15):
+            close_index_trade(idx_nm, cur_pxs, reason="3:15 PM Auto Square-Off")
+
+    if cfg.get("main_auto_10am") and now_ist.hour == 10 and now_ist.minute <= 3:
+        main_lots = int(cfg.get("main_lots", 1))
+        for idx_nm in cfg.get("main_indices", ["Nifty 50", "Sensex"]):
+            if idx_nm in trades_map or is_strategy_traded_today("main", today_str, idx_nm):
+                continue
+            cd = live_chains.get(idx_nm)
+            if cd and cd["oi_valid"]:
+                g_inf = evaluate_greeks_regime(idx_nm, cd["spot"], cd["df"], cd["exp_str"], oi_valid=True)
+                m_dir = g_inf.get("direction", "WAIT")
+                if m_dir in ["UP", "DOWN", "SIDEWAYS"]:
+                    meta = cd["info"]
+                    atm = round(cd["spot"] / meta["step"]) * meta["step"]
+                    s_name, s_sum, legs, _ = build_strategy_plan(m_dir, idx_nm, atm, meta["hedge"], cd["df"])
+                    ok_e, _ = execute_multi_leg_entry(
+                        "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)", idx_nm, s_name, s_sum,
+                        legs, main_lots, meta["lot"], cd["cmap"], trigger_src="Auto 10:00 AM"
+                    )
+                    if ok_e:
+                        mark_strategy_traded_today("main", today_str, idx_nm)
+
+    # 3. 16 EMA + OI: सक्रिय ट्रेडों के SL/TSL/2:59 PM Exit + 9:45-12:00 ऑटो-एंट्री (Nifty + Sensex दोनों)
+    try:
+        from pages.ema16_oi_algo import (
+            ema_fetch_intraday_candles, evaluate_ema16_oi_setup, pick_40_delta_spread,
+            ema_load_multi_active, ema_save_multi_active, ema_close_index_trade, ema_get_live_ltp
+        )
+        ema_map = ema_load_multi_active()
+        for idx_nm in list(ema_map.keys()):
+            etr = ema_map[idx_nm]
+            legs = etr["legs"]
+            toks = tuple(l["token"] for l in legs if l.get("token") and l["token"] != "0")
+            ltp_m = ema_get_live_ltp(jwt, akey, etr["exch"], toks) if toks else {}
+            cur_pxs = {}
+            pts = 0.0
+            for i, lg in enumerate(legs):
+                px = ltp_m.get(lg["token"], lg.get("last_valid_ltp", lg["entry_ltp"]))
+                if px > 0:
+                    lg["last_valid_ltp"] = px
+                else:
+                    px = float(lg.get("last_valid_ltp", lg["entry_ltp"]))
+                cur_pxs[i] = px
+                pts += (lg["entry_ltp"] - px) if lg["action"] == "SELL" else (px - lg["entry_ltp"])
+            mtm_rs = round(pts * etr["qty"], 2)
+            lots_tr = etr["lots"]
+            if not etr.get("tsl_active") and mtm_rs >= (1200.0 * lots_tr):
+                etr["tsl_active"] = True
+                etr["sl_rs"] = 200.0 * lots_tr
+                ema_save_multi_active(ema_map)
+            cur_sl = float(etr.get("sl_rs", -1700.0 * lots_tr))
+            if mtm_rs <= cur_sl:
+                ema_close_index_trade(idx_nm, cur_pxs, "TSL Hit 🔒" if etr.get("tsl_active") else "SL Hit 🛑")
+            elif curr_mins >= (14 * 60 + 59):
+                ema_close_index_trade(idx_nm, cur_pxs, "2:59 PM Auto Square-Off ⏰")
+
+        if cfg.get("ema_auto_arm") and (9 * 60 + 45) <= curr_mins <= (12 * 60):
+            e_tf = int(cfg.get("ema_tf", 5))
+            e_lots = int(cfg.get("ema_lots", 1))
+            for idx_nm in cfg.get("ema_indices", ["Nifty 50", "Sensex"]):
+                if idx_nm in ema_map or is_strategy_traded_today("ema", today_str, idx_nm):
+                    continue
+                cd = live_chains.get(idx_nm)
+                c_df = ema_fetch_intraday_candles(jwt, akey, idx_nm, e_tf, days_back=3)
+                if cd and cd["oi_valid"] and not c_df.empty:
+                    df_dte = cd["df"].copy()
+                    df_dte["DTE"] = max(0.2, float(cd["dte"]))
+                    setup = evaluate_ema16_oi_setup(c_df, cd["spot"], df_dte, idx_nm, e_tf, oi_valid=True)
+                    if setup["signal"] in ["BULLISH", "BEARISH"]:
+                        meta = cd["info"]
+                        s_nm, s_sm, p_lgs, _ = pick_40_delta_spread(setup["signal"], idx_nm, cd["spot"], df_dte)
+                        if not any(float(x.get("entry_ltp", 0)) <= 0 for x in p_lgs):
+                            total_q = meta["lot"] * e_lots
+                            ordered = [x for x in p_lgs if x["action"] == "BUY"] + [x for x in p_lgs if x["action"] == "SELL"]
+                            for lg in ordered:
+                                ci = cd["cmap"].get((lg["strike"], lg["side"]), {"symbol": "", "token": "0", "exch": meta["opt_exch"]})
+                                lg.update({"symbol": ci["symbol"], "token": ci["token"], "exch": ci["exch"], "last_valid_ltp": lg["entry_ltp"]})
+                            ema_map[idx_nm] = {
+                                "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)", "index": idx_nm, "tf": f"{e_tf}m",
+                                "direction": setup["signal"], "strategy": s_nm, "summary": s_sm,
+                                "lots": e_lots, "qty": total_q, "exch": meta["opt_exch"],
+                                "legs": ordered, "entry_time": now_str, "sl_rs": -1700.0 * e_lots, "tsl_active": False
+                            }
+                            ema_save_multi_active(ema_map)
+                            mark_strategy_traded_today("ema", today_str, idx_nm)
+                            send_telegram_alert(f"🚀 <b>16 EMA PAPER AUTO-ENTRY ({idx_nm})</b>\n{s_sm}\nTime: {now_str}")
+    except Exception:
+        pass
+
+    # 4. Smart 4-Layer Pro Algo: सक्रिय ट्रेडों के SL/Target/Exit + 10:00 AM ऑटो-एंट्री (Nifty + Sensex दोनों)
+    try:
+        from pages.pro_algo import (
+            fetch_intraday_vwap_orb, run_4layer_decision_engine, build_pro_legs,
+            load_pro_multi_active, save_pro_multi_active, close_pro_index_trade
+        )
+        pro_map = load_pro_multi_active()
+        for idx_nm in list(pro_map.keys()):
+            ptr = pro_map[idx_nm]
+            cd = live_chains.get(idx_nm)
+            if not cd:
+                continue
+            df_now = cd["df"]
+            tot_pnl = 0.0
+            for lg in ptr["legs"]:
+                if lg.get("closed"):
+                    tot_pnl += lg.get("realized_rs", 0.0)
+                    continue
+                r = df_now[df_now["STRIKE"] == lg["strike"]]
+                col = "CALL LTP" if lg["side"] == "CE" else "PUT LTP"
+                cpx = float(r[col].iloc[0]) if (not r.empty and float(r[col].iloc[0]) > 0) else float(lg.get("last_valid_ltp", lg["entry_ltp"]))
+                lg["last_valid_ltp"] = cpx
+                pts = (lg["entry_ltp"] - cpx) if lg["action"] == "SELL" else (cpx - lg["entry_ltp"])
+                tot_pnl += pts * ptr["qty"]
+            max_cr = ptr["max_credit_rs"]
+            if tot_pnl >= max_cr * 0.45 and not ptr.get("profit_locked"):
+                ptr["profit_locked"] = True
+                save_pro_multi_active(pro_map)
+            if max_cr > 0 and tot_pnl >= max_cr * 0.65:
+                close_pro_index_trade(idx_nm, tot_pnl, "65% Target 🎯")
+            elif ptr.get("profit_locked") and tot_pnl <= max_cr * 0.20:
+                close_pro_index_trade(idx_nm, tot_pnl, "Profit Lock Exit 🔒")
+            elif tot_pnl <= -ptr["hard_sl_rs"]:
+                close_pro_index_trade(idx_nm, tot_pnl, "38% Credit SL 🛑")
+            elif curr_mins >= (15 * 60 + 15):
+                close_pro_index_trade(idx_nm, tot_pnl, "3:15 PM Auto Square-Off ⏰")
+
+        if cfg.get("pro_auto") and now_ist.hour == 10 and now_ist.minute <= 3:
+            p_lots = int(cfg.get("pro_lots", 1))
+            for idx_nm in cfg.get("pro_indices", ["Nifty 50", "Sensex"]):
+                if idx_nm in pro_map or is_strategy_traded_today("pro", today_str, idx_nm):
+                    continue
+                cd = live_chains.get(idx_nm)
+                if cd and cd["oi_valid"]:
+                    orb_d = fetch_intraday_vwap_orb(jwt, akey, idx_nm, cd["spot"])
+                    g_inf = evaluate_greeks_regime(idx_nm, cd["spot"], cd["df"], cd["exp_str"], oi_valid=True)
+                    c_pack = {
+                        "df": cd["df"], "spot": cd["spot"], "atm": round(cd["spot"] / cd["info"]["step"]) * cd["info"]["step"],
+                        "exp_str": cd["exp_str"], "dte": cd["dte"], "cmap": cd["cmap"], "info": cd["info"], "oi_valid": True
+                    }
+                    verdict = run_4layer_decision_engine(c_pack, orb_d, g_inf)
+                    if verdict["decision"] in ["UP", "DOWN", "SIDEWAYS"]:
+                        s_nm, p_lgs, net_cr = build_pro_legs(verdict["decision"], c_pack)
+                        if not any(float(x.get("entry_ltp", 0)) <= 0 for x in p_lgs):
+                            meta = cd["info"]
+                            total_q = meta["lot"] * p_lots
+                            max_cr_rs = round(net_cr * total_q, 0)
+                            hard_sl = max(1200.0 * p_lots, round(max_cr_rs * 0.38, 0))
+                            ordered = [x for x in p_lgs if x["action"] == "BUY"] + [x for x in p_lgs if x["action"] == "SELL"]
+                            for lg in ordered:
+                                ci = cd["cmap"].get((lg["strike"], lg["side"]), {"symbol": "", "token": "0"})
+                                lg["symbol"], lg["token"] = ci["symbol"], ci["token"]
+                            pro_map[idx_nm] = {
+                                "mode": "🟡 Paper Trading", "index": idx_nm, "strategy": s_nm, "score": verdict["score"],
+                                "lots": p_lots, "qty": total_q, "exch": meta["opt_exch"], "legs": ordered,
+                                "entry_time": now_str, "max_credit_rs": max_cr_rs, "hard_sl_rs": hard_sl, "profit_locked": False
+                            }
+                            save_pro_multi_active(pro_map)
+                            mark_strategy_traded_today("pro", today_str, idx_nm)
+                            send_telegram_alert(f"🚀 <b>PRO ALGO PAPER AUTO-ENTRY ({idx_nm})</b>\n{s_nm}\nTime: {now_str}")
+    except Exception:
+        pass
+
+
+# ==========================================
 # Session Init & Mode Router
 # ==========================================
 jwt_glob, akey_glob = ensure_angel_session()
-run_background_paper_engines(jwt_glob, akey_glob)
 
 if "gh_sync_status" not in st.session_state:
     st.session_state["gh_sync_status"] = "Checking..."
@@ -770,8 +868,10 @@ if "trade_history" not in st.session_state:
 if "paper_capital" not in st.session_state:
     saved_pnl = sum(float(t.get("लाभ / हानि (₹)", 0)) for t in st.session_state["trade_history"] if t.get("मोड") == "Paper")
     st.session_state["paper_capital"] = 200000.0 + saved_pnl
-if "active_trade" not in st.session_state:
-    st.session_state["active_trade"] = load_active_trade()
+if "active_trades_map" not in st.session_state:
+    st.session_state["active_trades_map"] = load_multi_active_trades()
+
+run_full_background_engines(jwt_glob, akey_glob)
 
 mode = st.radio(
     "Select Mode:",
@@ -788,23 +888,29 @@ elif mode == "📈 16 EMA + OI Algo":
     exec(open("pages/ema16_oi_algo.py", encoding="utf-8").read())
     st.stop()
 
-st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram + Multi-Algo Auto Paper)")
+st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (Nifty + Sensex एक साथ ऑटो-ट्रेड)")
 
 cfg_now = load_algo_settings()
-st.markdown("#### ⚙️ स्थायी ऑटो-पेपर-ट्रेड कंट्रोल (पेज बदलने पर भी चालू रहेंगे)")
+st.markdown("#### ⚙️ स्थायी ऑटो-पेपर-ट्रेड कंट्रोल (एक ही रणनीति से Nifty 50 और Sensex दोनों में ट्रेड)")
 tg_c1, tg_c2, tg_c3 = st.columns(3)
 with tg_c1:
     t_main = st.toggle("1️⃣ Main Terminal (10:00 AM Auto)", value=bool(cfg_now.get("main_auto_10am")), key="pers_main_tog")
-    set_toggle_setting("main_auto_10am", t_main)
+    m_idxs = st.multiselect("Main इंडेक्स:", ["Nifty 50", "Sensex", "Bank Nifty"], default=cfg_now.get("main_indices", ["Nifty 50", "Sensex"]), key="pers_main_idxs")
 with tg_c2:
     t_ema = st.toggle("2️⃣ 16 EMA + OI (9:45–12:00 Auto)", value=bool(cfg_now.get("ema_auto_arm")), key="pers_ema_tog")
-    set_toggle_setting("ema_auto_arm", t_ema)
+    e_idxs = st.multiselect("16 EMA इंडेक्स:", ["Nifty 50", "Sensex"], default=cfg_now.get("ema_indices", ["Nifty 50", "Sensex"]), key="pers_ema_idxs")
 with tg_c3:
     t_pro = st.toggle("3️⃣ Smart 4-Layer Pro (10:00 AM Auto)", value=bool(cfg_now.get("pro_auto")), key="pers_pro_tog")
-    set_toggle_setting("pro_auto", t_pro)
+    p_idxs = st.multiselect("Pro इंडेक्स:", ["Nifty 50", "Sensex", "Bank Nifty"], default=cfg_now.get("pro_indices", ["Nifty 50", "Sensex"]), key="pers_pro_idxs")
+
+update_algo_settings_batch({
+    "main_auto_10am": t_main, "main_indices": m_idxs or ["Nifty 50"],
+    "ema_auto_arm": t_ema, "ema_indices": e_idxs or ["Nifty 50"],
+    "pro_auto": t_pro, "pro_indices": p_idxs or ["Nifty 50"],
+})
 
 tab1, tab2, tab3 = st.tabs([
-    "🤖 Paper & Live Algo ट्रेडिंग",
+    "🤖 Paper & Live Algo ट्रेडिंग (Nifty + Sensex)",
     "⛓️ लाइव ऑप्शन चेन (Angel One)",
     "📊 10:00 AM बैकटेस्ट (सही DTE)"
 ])
@@ -818,16 +924,17 @@ with tab1:
             horizontal=True
         )
     with m_col2:
-        algo_idx = st.selectbox("ट्रेडिंग इंडेक्स", ["Nifty 50", "Bank Nifty", "Sensex"], key="algo_idx")
+        algo_idx = st.selectbox("स्क्रीन पर देखें (इंडेक्स):", ["Nifty 50", "Sensex", "Bank Nifty"], key="algo_idx")
     with m_col3:
-        algo_lots = st.number_input("लॉट (Lots)", min_value=1, max_value=25, value=1, key="algo_lots")
+        algo_lots = st.number_input("लॉट (Lots)", min_value=1, max_value=25, value=int(cfg_now.get("main_lots", 1)), key="algo_lots")
+        update_algo_settings_batch({"main_lots": int(algo_lots)})
 
     live_unlocked = True
     if "LIVE ALGO" in trade_mode:
         st.warning("⚠️ **सावधान:** LIVE ALGO मोड में आपके Angel One अकाउंट से असली पैसे के ऑर्डर लगेंगे।")
         live_unlocked = st.checkbox("✅ मैं पुष्टि करता हूँ कि असली पैसे से ऑर्डर लगाए जाएं (Confirm Live Trading)")
 
-    st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` ({st.session_state['gh_sync_status']}) | 🛑 **Auto SL:** `₹{1700 * algo_lots:,.0f}` (`₹1,700/Lot`)")
+    st.info(f"💰 **पेपर बैलेंस:** `₹{st.session_state['paper_capital']:,.0f}` ({st.session_state['gh_sync_status']}) | 🛑 **Auto SL:** `₹{1700 * algo_lots:,.0f}/Index`")
 
     @st.fragment(run_every=10)
     def render_algo_dashboard(mode_sel, selected_idx, lots_cnt, is_unlocked):
@@ -837,21 +944,64 @@ with tab1:
         today_str = now_ist.strftime("%Y-%m-%d")
 
         jwt, akey = ensure_angel_session()
-        run_background_paper_engines(jwt, akey)
+        run_full_background_engines(jwt, akey)
         tg_cmd = check_telegram_commands()
 
-        meta = get_index_meta(selected_idx)
-        step, hedge_pts, lot_qty = meta["step"], meta["hedge"], meta["lot"]
-
         if not jwt or not akey:
-            st.error("🚨 Angel One SmartAPI लॉगिन नहीं है! सुरक्षा नियम के अनुसार बिना लाइव डेटा के ट्रेड बंद है।")
+            st.error("🚨 Angel One SmartAPI लॉगिन नहीं है! बिना लाइव डेटा के ट्रेड बंद है।")
             return
 
+        # 1. चालू पोजीशनें दिखाएं (Nifty 50 और Sensex दोनों एक साथ दिख सकते हैं)
+        trades_map = st.session_state.get("active_trades_map", {})
+        if trades_map:
+            st.markdown(f"### 🔥 चालू पोजीशनें ({len(trades_map)} इंडेक्स सक्रिय)")
+            for idx_k in list(trades_map.keys()):
+                tr = trades_map[idx_k]
+                legs = tr.get("legs", [])
+                tokens_tup = tuple(l["token"] for l in legs if l.get("token") and l["token"] != "0")
+                ltp_map = get_live_ltp_for_tokens(jwt, akey, tr["exch"], tokens_tup) if tokens_tup else {}
+
+                curr_ltp_by_idx = {}
+                live_pnl_pts = 0.0
+                for i, lg in enumerate(legs):
+                    if lg["token"] in ltp_map and ltp_map[lg["token"]] > 0:
+                        c_px = ltp_map[lg["token"]]
+                        lg["last_valid_ltp"] = c_px
+                    else:
+                        c_px = float(lg.get("last_valid_ltp", lg["entry_ltp"]))
+                    curr_ltp_by_idx[i] = c_px
+                    live_pnl_pts += (lg["entry_ltp"] - c_px) if lg["action"] == "SELL" else (c_px - lg["entry_ltp"])
+
+                live_pnl_rs = round(live_pnl_pts * tr["qty"], 2)
+
+                if tg_cmd == "STATUS":
+                    send_telegram_alert(f"📊 <b>STATUS ({idx_k})</b>: MTM <b>₹{live_pnl_rs:+,.0f}</b> | SL: -₹{int(tr['sl_rs']):,}")
+                if tg_cmd == "EXIT":
+                    if close_index_trade(idx_k, curr_ltp_by_idx, reason="Telegram /exit 📲"):
+                        st.rerun()
+                elif live_pnl_rs <= -tr["sl_rs"]:
+                    if close_index_trade(idx_k, curr_ltp_by_idx, reason=f"Auto SL Hit (-₹{int(tr['sl_rs'])})"):
+                        st.rerun()
+                elif now_ist.hour == 15 and now_ist.minute >= 15:
+                    if close_index_trade(idx_k, curr_ltp_by_idx, reason="3:15 PM Auto Square-Off"):
+                        st.rerun()
+
+                with st.container(border=True):
+                    c_top1, c_top2, c_top3 = st.columns([2, 1, 1])
+                    c_top1.markdown(f"**📌 {idx_k}** — {tr.get('strategy', '')} (`{tr['lots']} Lot / {tr['qty']} Qty`)")
+                    c_top2.metric("लाइव MTM", f"₹{live_pnl_rs:+,.0f}", f"SL: -₹{int(tr['sl_rs']):,}")
+                    if c_top3.button(f"🚨 {idx_k} बंद करें", key=f"sq_btn_{idx_k}", type="primary", use_container_width=True):
+                        if close_index_trade(idx_k, curr_ltp_by_idx, reason="Manual Square-Off"):
+                            st.rerun()
+
+        # 2. चुने हुए इंडेक्स का लाइव सिग्नल और 1-Click एंट्री (Nifty + Sensex दोनों में एक साथ बटन भी)
+        meta = get_index_meta(selected_idx)
+        step, hedge_pts, lot_qty = meta["step"], meta["hedge"], meta["lot"]
         full_df, spot_price, expiry_label, trading_dte, contract_map, oi_valid, oi_source, err = fetch_angel_live_oc(
             jwt, akey, selected_idx, 5
         )
         if full_df is None or full_df.empty or not spot_price:
-            st.error(f"⚠️ लाइव डेटा रुका हुआ है ({err}) — बिना असली डेटा के कोई ट्रेड या सिग्नल नहीं चलेगा।")
+            st.error(f"⚠️ लाइव डेटा रुका हुआ है ({err})")
             return
 
         atm_strike = round(spot_price / step) * step
@@ -863,107 +1013,67 @@ with tab1:
         up_3_call_chg = int(up_3_df["CALL CHG OI"].sum()) if (oi_valid and not up_3_df.empty) else 0
         down_3_put_chg = int(down_3_df["PUT CHG OI"].sum()) if (oi_valid and not down_3_df.empty) else 0
 
-        active_tr = st.session_state.get("active_trade")
-        if active_tr is not None:
-            st.markdown("### 🔥 चालू पोजीशन (Live MTM & Telegram Remote Control)")
-            legs = active_tr.get("legs", [])
-            tokens_tup = tuple(l["token"] for l in legs if l.get("token") and l["token"] != "0")
-            ltp_map = get_live_ltp_for_tokens(jwt, akey, active_tr["exch"], tokens_tup) if tokens_tup else {}
+        oi_disp = f"ऊपर 3 Call Chg OI: <b>{up_3_call_chg:+,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:+,}</b>" if oi_valid else "<b>Change in OI: N/A (कल का क्लोज़ OI उपलब्ध नहीं)</b>"
+        st.markdown(f"""
+        <div style="background: {g_info.get('bg_color', 'linear-gradient(90deg, #1e293b, #0f172a)')}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info.get('border_color', '#38bdf8')}; color: white; margin-bottom: 12px;">
+            <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 📅 Expiry: <b>{expiry_label} ({trading_dte} DTE)</b> | 📦 Lot: <b>{lot_qty}</b> | ⚡ Gamma-IV: <b>{g_info.get('gamma_iv_score', 0)}/100</b></div>
+            <div style="font-size: 13px; color: #cbd5e1; margin-top: 4px;">📊 {oi_disp} &nbsp;|&nbsp; स्रोत: <i>{oi_source}</i></div>
+            <div style="font-size: 21px; font-weight: bold; margin: 6px 0;">{g_info.get('headline', '⏳ प्रतीक्षा')}</div>
+            <div style="font-size: 15px; color: #fde047;">👉 {g_info.get('trade_plan', '')}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-            curr_ltp_by_idx = {}
-            live_pnl_pts = 0.0
-            missing_ltp = False
-            for i, lg in enumerate(legs):
-                if lg["token"] in ltp_map and ltp_map[lg["token"]] > 0:
-                    c_px = ltp_map[lg["token"]]
-                    lg["last_valid_ltp"] = c_px
-                else:
-                    c_px = float(lg.get("last_valid_ltp", lg["entry_ltp"]))
-                    missing_ltp = True
-                curr_ltp_by_idx[i] = c_px
-                live_pnl_pts += (lg["entry_ltp"] - c_px) if lg["action"] == "SELL" else (c_px - lg["entry_ltp"])
-
-            if missing_ltp:
-                st.warning("⚠️ एक या अधिक लेग का ताज़ा LTP अभी नहीं मिला — आखिरी असली भाव पर MTM दिख रहा है।")
-
-            live_pnl_rs = round(live_pnl_pts * active_tr["qty"], 2)
-
-            if tg_cmd == "STATUS":
-                send_telegram_alert(f"📊 <b>LIVE STATUS ({active_tr['index']})</b>\nMTM: <b>₹{live_pnl_rs:+,.0f}</b> | SL: -₹{int(active_tr['sl_rs']):,}")
-
-            if tg_cmd == "EXIT":
-                if close_active_trade(curr_ltp_by_idx, reason="Telegram /exit Command 📲"):
-                    st.rerun()
-            elif live_pnl_rs <= -active_tr["sl_rs"]:
-                if close_active_trade(curr_ltp_by_idx, reason=f"Auto SL Hit (-₹{int(active_tr['sl_rs'])})"):
-                    st.rerun()
-            elif now_ist.hour == 15 and now_ist.minute >= 15:
-                if close_active_trade(curr_ltp_by_idx, reason="3:15 PM Auto Square-Off"):
-                    st.rerun()
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("मोड & इंडेक्स", f"{active_tr['index']}", active_tr.get("strategy", ""))
-            m2.metric("मात्रा (Qty)", f"{active_tr['lots']} Lot", f"{active_tr['qty']} Qty")
-            m3.metric("लाइव MTM लाभ / हानि", f"₹{live_pnl_rs:+,.0f}", f"Auto SL: -₹{int(active_tr['sl_rs']):,}")
-
-            leg_cols = st.columns(len(legs))
-            for i, lg in enumerate(legs):
-                c_px = curr_ltp_by_idx[i]
-                leg_pnl = round(((lg["entry_ltp"] - c_px) if lg["action"] == "SELL" else (c_px - lg["entry_ltp"])) * active_tr["qty"], 0)
-                leg_cols[i].metric(f"{lg['action']} {lg['strike']} {lg['side']}", f"₹{c_px}", f"Entry: ₹{lg['entry_ltp']} | ₹{leg_pnl:+,.0f}")
-
-            if st.button("🚨 सभी लेग्स अभी बंद करें (Square-Off All)", type="primary", use_container_width=True):
-                if close_active_trade(curr_ltp_by_idx, reason="Manual Square-Off"):
-                    st.rerun()
-        else:
-            oi_disp = f"ऊपर 3 Call Chg OI: <b>{up_3_call_chg:+,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:+,}</b>" if oi_valid else "<b>Change in OI: N/A (कल का क्लोज़ OI उपलब्ध नहीं)</b>"
-            st.markdown(f"""
-            <div style="background: {g_info.get('bg_color', 'linear-gradient(90deg, #1e293b, #0f172a)')}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info.get('border_color', '#38bdf8')}; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 📅 Expiry: <b>{expiry_label} ({trading_dte} DTE)</b> | 📦 Lot: <b>{lot_qty}</b> | ⚡ Gamma-IV: <b>{g_info.get('gamma_iv_score', 0)}/100</b></div>
-                <div style="font-size: 13px; color: #cbd5e1; margin-top: 4px;">📊 {oi_disp} &nbsp;|&nbsp; स्रोत: <i>{oi_source}</i></div>
-                <div style="font-size: 21px; font-weight: bold; margin: 6px 0;">{g_info.get('headline', '⏳ प्रतीक्षा')}</div>
-                <div style="font-size: 15px; color: #fde047;">👉 {g_info.get('trade_plan', '')}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            if market_dir in ["UP", "DOWN", "SIDEWAYS"]:
+        b_c1, b_c2 = st.columns(2)
+        with b_c1:
+            if market_dir in ["UP", "DOWN", "SIDEWAYS"] and selected_idx not in trades_map:
                 strat_name, strat_summary, plan_legs, net_credit_pts = build_strategy_plan(
                     market_dir, selected_idx, atm_strike, hedge_pts, full_df
                 )
-                est_credit_rs = round(net_credit_pts * lot_qty * lots_cnt, 0)
-                st.caption(f"🎯 **तैयार सेटअप:** `{strat_summary}` | अनुमानित नेट क्रेडिट: `₹{est_credit_rs:,.0f}`")
-
-                already_done = is_strategy_traded_today("main", today_str)
-                if already_done:
-                    st.info("✅ आज का Main Terminal ऑटो-ट्रेड पहले ही लग चुका है (दिन में 1 ट्रेड नियम)।")
-
-                btn_label = f"🟡 1-Click PAPER TRADE — {strat_name} ({lots_cnt} Lot)" if "PAPER" in mode_sel else f"🔴 1-Click LIVE ORDER — {strat_name} ({lots_cnt} Lot)"
-                btn_disabled = ("LIVE ALGO" in mode_sel and not is_unlocked)
-
-                if st.button(btn_label, disabled=btn_disabled, use_container_width=True):
+                btn_lbl = f"1-Click {selected_idx} एंट्री ({strat_name})"
+                if st.button(btn_lbl, disabled=("LIVE ALGO" in mode_sel and not is_unlocked), use_container_width=True):
                     ok, msg = execute_multi_leg_entry(
                         mode_sel, selected_idx, strat_name, strat_summary, plan_legs,
                         lots_cnt, lot_qty, contract_map, trigger_src="1-Click Manual"
                     )
                     if ok:
-                        mark_strategy_traded_today("main", today_str)
-                        st.success(f"✅ {msg}")
+                        mark_strategy_traded_today("main", today_str, selected_idx)
                         st.rerun()
                     else:
-                        st.error(f"❌ {msg}")
+                        st.error(msg)
             else:
-                st.warning("⏳ अभी स्पष्ट सिग्नल नहीं है (WAIT) — गलत एंट्री से बचने के लिए 1-Click बटन होल्ड पर है।")
+                st.caption(f"ℹ️ {selected_idx}: {'पहले से ट्रेड चालू है' if selected_idx in trades_map else 'स्पष्ट सिग्नल (WAIT) की प्रतीक्षा'}")
+
+        with b_c2:
+            if st.button("🚀 Nifty 50 + Sensex दोनों में एक साथ सिग्नल ट्रेड डालें", disabled=("LIVE ALGO" in mode_sel and not is_unlocked), use_container_width=True):
+                any_placed = False
+                for both_idx in ["Nifty 50", "Sensex"]:
+                    if both_idx in trades_map:
+                        continue
+                    b_meta = get_index_meta(both_idx)
+                    b_df, b_sp, b_exp, _, b_cmap, b_oi, _, _ = fetch_angel_live_oc(jwt, akey, both_idx, 5)
+                    if b_df is not None and b_oi and b_sp:
+                        b_g = evaluate_greeks_regime(both_idx, b_sp, b_df, b_exp, oi_valid=True)
+                        b_dir = b_g.get("direction", "WAIT")
+                        if b_dir in ["UP", "DOWN", "SIDEWAYS"]:
+                            b_atm = round(b_sp / b_meta["step"]) * b_meta["step"]
+                            sn, ss, pl, _ = build_strategy_plan(b_dir, both_idx, b_atm, b_meta["hedge"], b_df)
+                            ok_b, msg_b = execute_multi_leg_entry(
+                                mode_sel, both_idx, sn, ss, pl, lots_cnt, b_meta["lot"], b_cmap, trigger_src="Nifty+Sensex Combo"
+                            )
+                            if ok_b:
+                                mark_strategy_traded_today("main", today_str, both_idx)
+                                any_placed = True
+                                st.success(msg_b)
+                            else:
+                                st.warning(msg_b)
+                        else:
+                            st.info(f"{both_idx}: अभी WAIT सिग्नल है।")
+                if any_placed:
+                    st.rerun()
 
         if st.session_state["trade_history"]:
             st.markdown("### 📜 ट्रेड बुक (Saved Trade History)")
             st.dataframe(pd.DataFrame(st.session_state["trade_history"]), use_container_width=True, hide_index=True)
-            with st.expander("🗑️ हिस्ट्री साफ करें (Confirmation आवश्यक)"):
-                confirm_del = st.checkbox("हाँ, मैं पक्का सारी ट्रेड हिस्ट्री मिटाना चाहता हूँ", key="confirm_del_hist")
-                if st.button("हिस्ट्री हमेशा के लिए मिटाएं", disabled=not confirm_del):
-                    st.session_state["trade_history"] = []
-                    st.session_state["paper_capital"] = 200000.0
-                    save_trade_history([])
-                    st.rerun()
 
     render_algo_dashboard(trade_mode, algo_idx, algo_lots, live_unlocked)
 
@@ -1049,8 +1159,6 @@ with tab2:
 
 with tab3:
     st.subheader("📊 10:00 AM बैकटेस्ट (छुट्टियों के अनुसार सही 0 DTE / 1 DTE सहित)")
-    st.info("ℹ️ नोट: यह बैकटेस्ट स्पॉट कैंडल व Black-Scholes मॉडल पर चलता है (नकली OI के बजाय सुबह के प्राइस मोमेंटम पर)। इसमें मंगलवार (Nifty) और गुरुवार (Sensex) की एक्सपायरी + छुट्टी के दिन एक दिन पहले शिफ्ट होने का सही कैलेंडर लगा है।")
-
     b1, b2, b3, b4 = st.columns(4)
     with b1:
         bt_idx = st.selectbox("इंडेक्स चुनें", ["Nifty 50", "Bank Nifty", "Sensex"], key="bt_idx")
