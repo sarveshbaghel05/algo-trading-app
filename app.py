@@ -15,6 +15,7 @@ from oi_base import (
     get_scrip_master_df,
     get_index_meta,
     get_live_expiry_info,
+    get_exact_t_years,
     build_backtest_dte_map,
     compute_accurate_chg_oi,
     load_algo_settings,
@@ -29,15 +30,170 @@ from oi_base import (
 
 st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 
-try:
-    from pages.otm_iv_indicator import evaluate_otm_iv_from_df
-except ImportError:
-    from otm_iv_indicator import evaluate_otm_iv_from_df
 
-try:
-    from pages.greek_regime_indicator import evaluate_greeks_regime
-except ImportError:
-    from greek_regime_indicator import evaluate_greeks_regime
+# ==========================================
+# Built-in Safe Fallbacks (ताकि कभी ModuleNotFoundError न आए)
+# ==========================================
+def _builtin_norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _builtin_norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _builtin_iv(option_price, spot, strike, t_years, opt_type="CE"):
+    if option_price <= 0.5 or t_years <= 1e-6 or spot <= 0 or strike <= 0:
+        return 0.14
+    intrinsic = max(0.0, spot - strike) if opt_type == "CE" else max(0.0, strike - spot)
+    if option_price <= intrinsic + 0.2:
+        return 0.08
+    low, high, r = 0.02, 2.00, 0.065
+    for _ in range(35):
+        mid = 0.5 * (low + high)
+        d1 = (math.log(spot / strike) + (r + 0.5 * mid * mid) * t_years) / (mid * math.sqrt(t_years))
+        d2 = d1 - mid * math.sqrt(t_years)
+        px = (spot * _builtin_norm_cdf(d1) - strike * math.exp(-r * t_years) * _builtin_norm_cdf(d2)) if opt_type == "CE" else (strike * math.exp(-r * t_years) * _builtin_norm_cdf(-d2) - spot * _builtin_norm_cdf(-d1))
+        if px > option_price:
+            high = mid
+        else:
+            low = mid
+    return round(0.5 * (low + high), 4)
+
+
+def _builtin_evaluate_otm_iv(selected_idx, spot_price, full_df, expiry_label, oi_valid=True):
+    meta = get_index_meta(selected_idx)
+    step, hedge_dist = meta["step"], meta["hedge"]
+    atm_strike = round(spot_price / step) * step
+    if full_df is None or full_df.empty or expiry_label in ["Unknown", "Simulation", "DEMO"] or not oi_valid:
+        return {
+            "signal": "WAIT", "spread_name": "डेटा की प्रतीक्षा (WAIT)", "sell_leg": "-", "buy_hedge": "-",
+            "avg_otm_ce_iv": 0.0, "avg_otm_pe_iv": 0.0, "ce_iv_change": 0.0, "pe_iv_change": 0.0,
+            "top3_ce_chg_oi": 0, "bottom3_pe_chg_oi": 0, "message": "असली लाइव डेटा और कल के क्लोज़िंग OI की प्रतीक्षा है।"
+        }
+    t_years = get_exact_t_years(expiry_label)
+    up_3 = full_df[full_df["STRIKE"].isin([atm_strike + step, atm_strike + 2 * step, atm_strike + 3 * step])]
+    dn_3 = full_df[full_df["STRIKE"].isin([atm_strike - step, atm_strike - 2 * step, atm_strike - 3 * step])]
+    top3_ce_chg = int(up_3["CALL CHG OI"].sum()) if not up_3.empty else 0
+    bot3_pe_chg = int(dn_3["PUT CHG OI"].sum()) if not dn_3.empty else 0
+    ce_ivs = [_builtin_iv(float(r["CALL LTP"]), spot_price, int(r["STRIKE"]), t_years, "CE") * 100.0 for _, r in up_3.iterrows() if float(r["CALL LTP"]) > 0.5]
+    pe_ivs = [_builtin_iv(float(r["PUT LTP"]), spot_price, int(r["STRIKE"]), t_years, "PE") * 100.0 for _, r in dn_3.iterrows() if float(r["PUT LTP"]) > 0.5]
+    avg_ce = round(sum(ce_ivs) / len(ce_ivs), 2) if ce_ivs else 0.0
+    avg_pe = round(sum(pe_ivs) / len(pe_ivs), 2) if pe_ivs else 0.0
+    skew = round(avg_pe - avg_ce, 2)
+
+    if bot3_pe_chg > 0 and bot3_pe_chg >= top3_ce_chg * 1.20:
+        return {
+            "signal": "BUY_SIGNAL", "spread_name": "BULL PUT SPREAD (मजबूत अपट्रेंड)",
+            "sell_leg": f"{atm_strike} PE", "buy_hedge": f"{atm_strike - hedge_dist} PE",
+            "avg_otm_ce_iv": avg_ce, "avg_otm_pe_iv": avg_pe, "ce_iv_change": 0.0, "pe_iv_change": 0.0,
+            "top3_ce_chg_oi": top3_ce_chg, "bottom3_pe_chg_oi": bot3_pe_chg,
+            "message": f"नीचे Put राइटिंग मज़बूत है ({bot3_pe_chg:+,}) | IV Skew: {skew:+}%"
+        }
+    elif top3_ce_chg > 0 and top3_ce_chg >= bot3_pe_chg * 1.20:
+        return {
+            "signal": "BUY_SIGNAL", "spread_name": "BEAR CALL SPREAD (मजबूत डाउनट्रेंड)",
+            "sell_leg": f"{atm_strike} CE", "buy_hedge": f"{atm_strike + hedge_dist} CE",
+            "avg_otm_ce_iv": avg_ce, "avg_otm_pe_iv": avg_pe, "ce_iv_change": 0.0, "pe_iv_change": 0.0,
+            "top3_ce_chg_oi": top3_ce_chg, "bottom3_pe_chg_oi": bot3_pe_chg,
+            "message": f"ऊपर Call राइटिंग भारी है ({top3_ce_chg:+,}) | IV Skew: {skew:+}%"
+        }
+    return {
+        "signal": "WAIT", "spread_name": "स्पष्ट ट्रेंड की प्रतीक्षा", "sell_leg": "-", "buy_hedge": "-",
+        "avg_otm_ce_iv": avg_ce, "avg_otm_pe_iv": avg_pe, "ce_iv_change": 0.0, "pe_iv_change": 0.0,
+        "top3_ce_chg_oi": top3_ce_chg, "bottom3_pe_chg_oi": bot3_pe_chg,
+        "message": "Call और Put राइटिंग में स्पष्ट एकतरफ़ा अंतर नहीं है।"
+    }
+
+
+def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unknown", oi_valid=True):
+    meta = get_index_meta(selected_idx)
+    step, hedge_pts = meta["step"], meta["hedge"]
+    atm_strike = round(spot_price / step) * step
+    if full_df is None or full_df.empty or expiry_str in ["Unknown", "Simulation", "DEMO"] or not oi_valid:
+        return {
+            "direction": "WAIT", "headline": "⏳ असली डेटा व क्लोज़िंग OI की प्रतीक्षा (WAIT)",
+            "bg_color": "linear-gradient(90deg, #334155, #1e293b)", "border_color": "#f59e0b",
+            "gamma_iv_risk": 0.0, "gamma_iv_score": 0.0, "trade_plan": "कल का क्लोज़िंग OI और लाइव डेटा उपलब्ध होने दें।"
+        }
+    atm_row = full_df[full_df["STRIKE"] == atm_strike]
+    if atm_row.empty:
+        return {
+            "direction": "WAIT", "headline": "⏳ ATM डेटा लोड हो रहा है...",
+            "bg_color": "linear-gradient(90deg, #334155, #1e293b)", "border_color": "#64748b",
+            "gamma_iv_risk": 0.0, "gamma_iv_score": 0.0, "trade_plan": "प्रतीक्षा करें।"
+        }
+    t_years = max(get_exact_t_years(expiry_str), 1.0 / (365.0 * 24.0))
+    ce_iv = max(_builtin_iv(float(atm_row["CALL LTP"].iloc[0]), spot_price, atm_strike, t_years, "CE"), 0.05)
+    pe_iv = max(_builtin_iv(float(atm_row["PUT LTP"].iloc[0]), spot_price, atm_strike, t_years, "PE"), 0.05)
+    r = 0.065
+    d1_c = (math.log(spot_price / atm_strike) + (r + 0.5 * ce_iv * ce_iv) * t_years) / (ce_iv * math.sqrt(t_years))
+    d1_p = (math.log(spot_price / atm_strike) + (r + 0.5 * pe_iv * pe_iv) * t_years) / (pe_iv * math.sqrt(t_years))
+    net_delta = round(_builtin_norm_cdf(d1_c) + (_builtin_norm_cdf(d1_p) - 1.0), 3)
+    avg_gamma = ((_builtin_norm_pdf(d1_c) / (spot_price * ce_iv * math.sqrt(t_years))) + (_builtin_norm_pdf(d1_p) / (spot_price * pe_iv * math.sqrt(t_years)))) / 2.0
+    avg_iv_pct = ((ce_iv + pe_iv) / 2.0) * 100.0
+    gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
+
+    if gamma_iv_risk >= 65.0:
+        return {
+            "direction": "WAIT", "headline": "🚨 अत्यधिक Gamma-IV खतरा — ट्रेड से बचें (NO-TRADE)",
+            "bg_color": "linear-gradient(90deg, #4c0519, #1e1b4b)", "border_color": "#f43f5e",
+            "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
+            "trade_plan": "बाज़ार में अचानक तेज़ झटके का जोखिम है — नई सेलिंग से बचें।"
+        }
+
+    up_3 = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3 * step)]
+    dn_3 = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3 * step)]
+    up_ce = int(up_3["CALL CHG OI"].sum()) if not up_3.empty else 0
+    dn_pe = int(dn_3["PUT CHG OI"].sum()) if not dn_3.empty else 0
+
+    bull_pts = (2 if (dn_pe > 0 and dn_pe >= up_ce * 1.25) else 0) + (1 if net_delta >= 0.06 else 0)
+    bear_pts = (2 if (up_ce > 0 and up_ce >= dn_pe * 1.25) else 0) + (1 if net_delta <= -0.06 else 0)
+
+    if bull_pts >= 2 and bull_pts > bear_pts:
+        return {
+            "direction": "UP", "headline": "🟢 आज मार्केट ऊपर जा सकता है (BULLISH)",
+            "bg_color": "linear-gradient(90deg, #064e3b, #022c22)", "border_color": "#10b981",
+            "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
+            "trade_plan": f"क्या करें: {atm_strike} PE बेचें और {atm_strike - hedge_pts} PE हेज खरीदें (Bull Put Spread)।"
+        }
+    elif bear_pts >= 2 and bear_pts > bull_pts:
+        return {
+            "direction": "DOWN", "headline": "🔴 आज मार्केट नीचे जा सकता है (BEARISH)",
+            "bg_color": "linear-gradient(90deg, #7f1d1d, #450a0a)", "border_color": "#ef4444",
+            "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
+            "trade_plan": f"क्या करें: {atm_strike} CE बेचें और {atm_strike + hedge_pts} CE हेज खरीदें (Bear Call Spread)।"
+        }
+    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 50.0 and abs(net_delta) < 0.08:
+        return {
+            "direction": "SIDEWAYS", "headline": "🟡 आज मार्केट साइडवेज रहेगा (RANGE-BOUND)",
+            "bg_color": "linear-gradient(90deg, #78350f, #451a03)", "border_color": "#f59e0b",
+            "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
+            "trade_plan": f"क्या करें: {atm_strike} CE+PE Straddle बेचें + {atm_strike + hedge_pts} CE और {atm_strike - hedge_pts} PE हेज खरीदें।"
+        }
+    return {
+        "direction": "WAIT", "headline": "⏳ स्पष्ट सिग्नल की प्रतीक्षा (WAIT)",
+        "bg_color": "linear-gradient(90deg, #334155, #1e293b)", "border_color": "#94a3b8",
+        "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
+        "trade_plan": "अभी स्पष्ट सहमति नहीं बनी है — थोड़ा इंतज़ार करें।"
+    }
+
+
+evaluate_otm_iv_from_df = _builtin_evaluate_otm_iv
+for _m in ["pages.otm_iv_indicator", "otm_iv_indicator"]:
+    try:
+        evaluate_otm_iv_from_df = getattr(__import__(_m, fromlist=["evaluate_otm_iv_from_df"]), "evaluate_otm_iv_from_df")
+        break
+    except Exception:
+        continue
+
+evaluate_greeks_regime = _builtin_evaluate_greeks
+for _m in ["pages.greek_regime_indicator", "pages.greeks_regime_indicator", "greek_regime_indicator", "greeks_regime_indicator"]:
+    try:
+        evaluate_greeks_regime = getattr(__import__(_m, fromlist=["evaluate_greeks_regime"]), "evaluate_greeks_regime")
+        break
+    except Exception:
+        continue
 
 
 # ==========================================
@@ -109,7 +265,8 @@ def place_angel_order(jwt_token, api_key, exchange, trading_symbol, symbol_token
         "producttype": "INTRADAY", "duration": "DAY", "price": "0",
         "squareoff": "0", "stoploss": "0", "quantity": str(quantity)
     }
-    for attempt in range(3):
+    last_err = "Order Rejected"
+    for _ in range(3):
         try:
             res = requests.post(url, json=payload, headers=headers, timeout=10).json()
             if res.get("status"):
@@ -231,7 +388,6 @@ def fetch_angel_live_oc_raw(jwt_token, api_key, selected_idx, s_range):
 
 
 def record_daily_oc_snapshot(selected_idx, spot_price, exp_str, df_oc):
-    """तारीख के हिसाब से अलग फ़ाइल में सेव करें ताकि 1MB सीमा से पुराना डेटा न मिटे"""
     try:
         ist = pytz.timezone("Asia/Kolkata")
         now_ist = datetime.now(ist)
@@ -279,7 +435,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 
 # ==========================================
 # Background Multi-Strategy Paper Auto-Runner
-# (तीनों रणनीतियों में अपने आप पेपर ट्रेड चलाने वाला साझा इंजन)
 # ==========================================
 def run_background_paper_engines(jwt, akey):
     """आप किसी भी पेज पर हों, जिन रणनीतियों के टॉगल ON हैं उनके पेपर ट्रेड पीछे से अपने आप चलेंगे"""
@@ -293,7 +448,6 @@ def run_background_paper_engines(jwt, akey):
     if curr_mins < (9 * 60 + 15) or curr_mins > (15 * 60 + 25):
         return
 
-    # हर 12 सेकंड में एक बार ही बैकग्राउंड चेक चलाएं
     if time.time() - st.session_state.get("bg_runner_last_ts", 0) < 12:
         return
     st.session_state["bg_runner_last_ts"] = time.time()
@@ -506,7 +660,6 @@ def execute_multi_leg_entry(mode, selected_idx, strat_name, summary, legs, lots,
     total_qty = lots * lot_qty
     exch = "BFO" if selected_idx == "Sensex" else "NFO"
 
-    # शून्य भाव (0 LTP) वाले अधूरे लेग्स पर एंट्री रोकें
     if any(float(lg.get("entry_ltp", 0)) <= 0 for lg in legs):
         return False, "किसी स्ट्राइक का लाइव भाव (LTP) 0 आ रहा है — सुरक्षा हेतु एंट्री रोकी गई।"
 
@@ -647,7 +800,6 @@ elif mode == "📈 16 EMA + OI Algo":
 
 st.title("🛡️ ऑप्शन सेलर एल्गो टर्मिनल (2-Way Telegram + Multi-Algo Auto Paper)")
 
-# तीनों रणनीतियों के स्थायी टॉगल बार (पेज बदलने पर भी कभी रीसेट नहीं होंगे)
 cfg_now = load_algo_settings()
 st.markdown("#### ⚙️ स्थायी ऑटो-पेपर-ट्रेड कंट्रोल (पेज बदलने पर भी चालू रहेंगे)")
 tg_c1, tg_c2, tg_c3 = st.columns(3)
@@ -736,7 +888,6 @@ with tab1:
                     c_px = ltp_map[lg["token"]]
                     lg["last_valid_ltp"] = c_px
                 else:
-                    # कभी भी random नंबर न जोड़ें — आखिरी असली भाव ही रखें
                     c_px = float(lg.get("last_valid_ltp", lg["entry_ltp"]))
                     missing_ltp = True
                 curr_ltp_by_idx[i] = c_px
