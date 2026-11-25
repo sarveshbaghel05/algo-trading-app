@@ -32,7 +32,7 @@ st.set_page_config(page_title="Option Seller Algo Terminal", layout="wide")
 
 
 # ==========================================
-# Built-in Safe Fallbacks (ताकि कभी ModuleNotFoundError न आए)
+# Built-in Safe Fallbacks (सही Gamma-IV स्केल के साथ)
 # ==========================================
 def _builtin_norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -59,6 +59,14 @@ def _builtin_iv(option_price, spot, strike, t_years, opt_type="CE"):
         else:
             low = mid
     return round(0.5 * (low + high), 4)
+
+
+def _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_decimal):
+    """0-100 स्केल पर सटीक Gamma-IV स्कोर (सामान्य दिन: 20-45, तेज़ हलचल: 50-65, पैनिक: 65+)"""
+    one_pct_move = spot_price * 0.01
+    delta_shift_1pct = avg_gamma * one_pct_move  # 1% चाल पर Delta में बदलाव (सामान्यतः 0.15 से 0.45)
+    raw_score = (delta_shift_1pct * 95.0) + (avg_iv_decimal * 65.0)
+    return round(min(100.0, max(5.0, raw_score)), 1)
 
 
 def _builtin_evaluate_otm_iv(selected_idx, spot_price, full_df, expiry_label, oi_valid=True):
@@ -131,12 +139,12 @@ def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unkn
     d1_p = (math.log(spot_price / atm_strike) + (r + 0.5 * pe_iv * pe_iv) * t_years) / (pe_iv * math.sqrt(t_years))
     net_delta = round(_builtin_norm_cdf(d1_c) + (_builtin_norm_cdf(d1_p) - 1.0), 3)
     avg_gamma = ((_builtin_norm_pdf(d1_c) / (spot_price * ce_iv * math.sqrt(t_years))) + (_builtin_norm_pdf(d1_p) / (spot_price * pe_iv * math.sqrt(t_years)))) / 2.0
-    avg_iv_pct = ((ce_iv + pe_iv) / 2.0) * 100.0
-    gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
+    avg_iv_dec = (ce_iv + pe_iv) / 2.0
+    gamma_iv_risk = _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_dec)
 
-    if gamma_iv_risk >= 65.0:
+    if gamma_iv_risk >= 68.0:
         return {
-            "direction": "WAIT", "headline": "🚨 अत्यधिक Gamma-IV खतरा — ट्रेड से बचें (NO-TRADE)",
+            "direction": "WAIT", "headline": f"🚨 अत्यधिक Gamma-IV खतरा ({gamma_iv_risk}/100) — ट्रेड से बचें",
             "bg_color": "linear-gradient(90deg, #4c0519, #1e1b4b)", "border_color": "#f43f5e",
             "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
             "trade_plan": "बाज़ार में अचानक तेज़ झटके का जोखिम है — नई सेलिंग से बचें।"
@@ -164,7 +172,7 @@ def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unkn
             "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
             "trade_plan": f"क्या करें: {atm_strike} CE बेचें और {atm_strike + hedge_pts} CE हेज खरीदें (Bear Call Spread)।"
         }
-    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 50.0 and abs(net_delta) < 0.08:
+    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 55.0 and abs(net_delta) < 0.08:
         return {
             "direction": "SIDEWAYS", "headline": "🟡 आज मार्केट साइडवेज रहेगा (RANGE-BOUND)",
             "bg_color": "linear-gradient(90deg, #78350f, #451a03)", "border_color": "#f59e0b",
@@ -175,25 +183,12 @@ def _builtin_evaluate_greeks(selected_idx, spot_price, full_df, expiry_str="Unkn
         "direction": "WAIT", "headline": "⏳ स्पष्ट सिग्नल की प्रतीक्षा (WAIT)",
         "bg_color": "linear-gradient(90deg, #334155, #1e293b)", "border_color": "#94a3b8",
         "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk,
-        "trade_plan": "अभी स्पष्ट सहमति नहीं बनी है — थोड़ा इंतज़ार करें।"
+        "trade_plan": f"Gamma-IV स्कोर: {gamma_iv_risk}/100 — अभी स्पष्ट सहमति नहीं बनी है।"
     }
 
 
 evaluate_otm_iv_from_df = _builtin_evaluate_otm_iv
-for _m in ["pages.otm_iv_indicator", "otm_iv_indicator"]:
-    try:
-        evaluate_otm_iv_from_df = getattr(__import__(_m, fromlist=["evaluate_otm_iv_from_df"]), "evaluate_otm_iv_from_df")
-        break
-    except Exception:
-        continue
-
 evaluate_greeks_regime = _builtin_evaluate_greeks
-for _m in ["pages.greek_regime_indicator", "pages.greeks_regime_indicator", "greek_regime_indicator", "greeks_regime_indicator"]:
-    try:
-        evaluate_greeks_regime = getattr(__import__(_m, fromlist=["evaluate_greeks_regime"]), "evaluate_greeks_regime")
-        break
-    except Exception:
-        continue
 
 
 # ==========================================
@@ -231,8 +226,7 @@ def check_telegram_commands():
             if upd_id > max_uid:
                 max_uid = upd_id
             msg = update.get("message", {})
-            msg_age = now_ts - float(msg.get("date", now_ts))
-            if msg_age > 90:
+            if now_ts - float(msg.get("date", now_ts)) > 90:
                 continue
             sender_id = str(msg.get("chat", {}).get("id", ""))
             text = msg.get("text", "").strip().upper()
@@ -437,7 +431,6 @@ def fetch_angel_live_oc(jwt_token, api_key, selected_idx, s_range):
 # Background Multi-Strategy Paper Auto-Runner
 # ==========================================
 def run_background_paper_engines(jwt, akey):
-    """आप किसी भी पेज पर हों, जिन रणनीतियों के टॉगल ON हैं उनके पेपर ट्रेड पीछे से अपने आप चलेंगे"""
     if not jwt or not akey:
         return
     ist = pytz.timezone("Asia/Kolkata")
@@ -456,7 +449,6 @@ def run_background_paper_engines(jwt, akey):
     today_str = now_ist.strftime("%Y-%m-%d")
     now_str = now_ist.strftime("%I:%M:%S %p")
 
-    # 1. Main Terminal (10:00 AM Auto Paper)
     if cfg.get("main_auto_10am") and not is_strategy_traded_today("main", today_str):
         if now_ist.hour == 10 and now_ist.minute <= 3:
             raw_act, _, _ = gh_read_text("active_trade_state.json")
@@ -478,7 +470,6 @@ def run_background_paper_engines(jwt, akey):
                         )
                         mark_strategy_traded_today("main", today_str)
 
-    # 2. 16 EMA + OI (9:45 AM – 12:00 PM Auto Paper)
     if cfg.get("ema_auto_arm") and not is_strategy_traded_today("ema", today_str):
         if (9 * 60 + 45) <= curr_mins <= (12 * 60):
             try:
@@ -520,7 +511,6 @@ def run_background_paper_engines(jwt, akey):
             except Exception:
                 pass
 
-    # 3. Smart 4-Layer Pro Algo (10:00 AM Auto Paper)
     if cfg.get("pro_auto") and not is_strategy_traded_today("pro", today_str):
         if now_ist.hour == 10 and now_ist.minute <= 3:
             try:
@@ -929,7 +919,7 @@ with tab1:
             oi_disp = f"ऊपर 3 Call Chg OI: <b>{up_3_call_chg:+,}</b> vs नीचे 3 Put Chg OI: <b>{down_3_put_chg:+,}</b>" if oi_valid else "<b>Change in OI: N/A (कल का क्लोज़ OI उपलब्ध नहीं)</b>"
             st.markdown(f"""
             <div style="background: {g_info.get('bg_color', 'linear-gradient(90deg, #1e293b, #0f172a)')}; padding: 16px 20px; border-radius: 12px; border-left: 6px solid {g_info.get('border_color', '#38bdf8')}; color: white; margin-bottom: 12px;">
-                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 📅 Expiry: <b>{expiry_label} ({trading_dte} DTE)</b> | 📦 Lot: <b>{lot_qty}</b> | 🛡️ Hedge: <b>{hedge_pts} pts</b></div>
+                <div style="font-size: 13px; color: #e2e8f0;">⏱️ {now_str} | 📍 {selected_idx} Spot: <b>{spot_price:,.2f}</b> | 📅 Expiry: <b>{expiry_label} ({trading_dte} DTE)</b> | 📦 Lot: <b>{lot_qty}</b> | ⚡ Gamma-IV: <b>{g_info.get('gamma_iv_score', 0)}/100</b></div>
                 <div style="font-size: 13px; color: #cbd5e1; margin-top: 4px;">📊 {oi_disp} &nbsp;|&nbsp; स्रोत: <i>{oi_source}</i></div>
                 <div style="font-size: 21px; font-weight: bold; margin: 6px 0;">{g_info.get('headline', '⏳ प्रतीक्षा')}</div>
                 <div style="font-size: 15px; color: #fde047;">👉 {g_info.get('trade_plan', '')}</div>
