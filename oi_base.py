@@ -1,3 +1,4 @@
+import os
 import json
 import base64
 import time
@@ -7,24 +8,37 @@ import pytz
 import pandas as pd
 import requests
 import pyotp
-import streamlit as st
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
 
 DEFAULT_GH_REPO = "Sarveshbaghel05/algo-trading-app"
 SETTINGS_FILE = "algo_settings.json"
 EOD_OI_FILE = "daily_eod_oi.json"
 OC_RECORD_FILE = "recorded_oc_history.csv"
 
+_MEM_CACHE = {}
+
+
+def _get_secret(key_name, default_val=""):
+    # पहले Streamlit secrets देखें, न मिले तो Render/OS Environment Variables देखें
+    try:
+        if st is not None and key_name in st.secrets:
+            return str(st.secrets[key_name]).strip()
+    except Exception:
+        pass
+    return str(os.environ.get(key_name, default_val)).strip()
+
 
 # ==========================================
 # 1. GitHub Storage Helpers (1MB+ Safe)
 # ==========================================
 def get_gh_config():
-    try:
-        token = st.secrets.get("GITHUB_TOKEN", "").strip()
-        repo = st.secrets.get("GITHUB_REPO", DEFAULT_GH_REPO).strip()
-        return token, repo
-    except Exception:
-        return "", DEFAULT_GH_REPO
+    token = _get_secret("GITHUB_TOKEN", "")
+    repo = _get_secret("GITHUB_REPO", DEFAULT_GH_REPO) or DEFAULT_GH_REPO
+    return token, repo
 
 
 def gh_read_text(filepath):
@@ -45,7 +59,6 @@ def gh_read_text(filepath):
         if content_b64:
             raw_txt = base64.b64decode(content_b64).decode("utf-8")
             return raw_txt, sha, "OK"
-        # यदि फ़ाइल 1MB से बड़ी है तो raw header से पढ़ें
         headers_raw = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.raw"}
         raw_res = requests.get(url, headers=headers_raw, timeout=12)
         if raw_res.status_code == 200:
@@ -92,19 +105,29 @@ def gh_write_json(filepath, data_obj, commit_msg):
 
 
 # ==========================================
-# 2. Persistent Toggle & Daily Trade Lock
+# 2. Persistent Settings (Multi-Index Nifty + Sensex)
 # ==========================================
-def load_algo_settings():
-    """तीनों रणनीतियों के टॉगल और दैनिक ट्रेड लॉक GitHub से लोड करना"""
+def load_algo_settings(force_refresh=False):
+    """तीनों रणनीतियों के टॉगल, इंडेक्स लिस्ट और दैनिक लॉक लोड करना"""
     defaults = {
         "main_auto_10am": False,
+        "main_indices": ["Nifty 50", "Sensex"],
+        "main_lots": 1,
         "ema_auto_arm": False,
+        "ema_indices": ["Nifty 50", "Sensex"],
+        "ema_tf": 5,
+        "ema_lots": 1,
         "pro_auto": False,
-        "traded_dates": {"main": "", "ema": "", "pro": ""},
+        "pro_indices": ["Nifty 50", "Sensex"],
+        "pro_lots": 1,
+        "traded_dates": {},
         "last_tg_update_id": 0,
     }
-    if "persistent_settings_cache" in st.session_state:
-        cfg = st.session_state["persistent_settings_cache"]
+
+    now_ts = time.time()
+    cache_age = now_ts - _MEM_CACHE.get("settings_ts", 0)
+    if not force_refresh and "settings_obj" in _MEM_CACHE and cache_age < 20:
+        cfg = _MEM_CACHE["settings_obj"]
         for k, v in defaults.items():
             if k not in cfg:
                 cfg[k] = v
@@ -115,34 +138,50 @@ def load_algo_settings():
         if k not in loaded:
             loaded[k] = v
     if not isinstance(loaded.get("traded_dates"), dict):
-        loaded["traded_dates"] = {"main": "", "ema": "", "pro": ""}
-    st.session_state["persistent_settings_cache"] = loaded
+        loaded["traded_dates"] = {}
+
+    _MEM_CACHE["settings_obj"] = loaded
+    _MEM_CACHE["settings_ts"] = now_ts
     return loaded
 
 
 def save_algo_settings(cfg):
-    st.session_state["persistent_settings_cache"] = cfg
+    _MEM_CACHE["settings_obj"] = cfg
+    _MEM_CACHE["settings_ts"] = time.time()
     gh_write_json(SETTINGS_FILE, cfg, "Update persistent algo settings")
 
 
-def set_toggle_setting(key_name, bool_val):
+def update_algo_settings_batch(updates_dict):
+    """केवल तभी GitHub पर सेव करें जब सचमुच कोई मान बदला हो"""
     cfg = load_algo_settings()
-    if bool(cfg.get(key_name)) != bool(bool_val):
-        cfg[key_name] = bool(bool_val)
+    changed = False
+    for k, v in updates_dict.items():
+        if cfg.get(k) != v:
+            cfg[k] = v
+            changed = True
+    if changed:
         save_algo_settings(cfg)
 
 
-def is_strategy_traded_today(strategy_key, today_str):
-    cfg = load_algo_settings()
-    return cfg.get("traded_dates", {}).get(strategy_key, "") == today_str
+def set_toggle_setting(key_name, bool_val):
+    update_algo_settings_batch({key_name: bool(bool_val)})
 
 
-def mark_strategy_traded_today(strategy_key, today_str):
+def is_strategy_traded_today(strategy_key, today_str, idx_name="ALL"):
     cfg = load_algo_settings()
-    if "traded_dates" not in cfg or not isinstance(cfg["traded_dates"], dict):
-        cfg["traded_dates"] = {"main": "", "ema": "", "pro": ""}
-    cfg["traded_dates"][strategy_key] = today_str
-    save_algo_settings(cfg)
+    td = cfg.get("traded_dates", {})
+    slot_key = f"{strategy_key}_{idx_name}"
+    return td.get(slot_key, "") == today_str or td.get(strategy_key, "") == today_str
+
+
+def mark_strategy_traded_today(strategy_key, today_str, idx_name="ALL"):
+    cfg = load_algo_settings()
+    if not isinstance(cfg.get("traded_dates"), dict):
+        cfg["traded_dates"] = {}
+    slot_key = f"{strategy_key}_{idx_name}"
+    if cfg["traded_dates"].get(slot_key) != today_str:
+        cfg["traded_dates"][slot_key] = today_str
+        save_algo_settings(cfg)
 
 
 def get_saved_tg_offset():
@@ -152,7 +191,8 @@ def get_saved_tg_offset():
 
 def save_tg_offset(new_offset):
     cfg = load_algo_settings()
-    if int(new_offset) > int(cfg.get("last_tg_update_id", 0) or 0):
+    cur = int(cfg.get("last_tg_update_id", 0) or 0)
+    if int(new_offset) > cur:
         cfg["last_tg_update_id"] = int(new_offset)
         save_algo_settings(cfg)
 
@@ -160,49 +200,61 @@ def save_tg_offset(new_offset):
 # ==========================================
 # 3. Angel One Auto-Login & Scrip Master
 # ==========================================
-def ensure_angel_session():
-    if "angel_jwt" in st.session_state and "angel_key" in st.session_state:
-        return st.session_state["angel_jwt"], st.session_state["angel_key"]
+def ensure_angel_session(force_relogin=False):
+    now_ts = time.time()
+    if not force_relogin and "angel_jwt" in _MEM_CACHE and (now_ts - _MEM_CACHE.get("angel_login_ts", 0)) < 14400:
+        return _MEM_CACHE["angel_jwt"], _MEM_CACHE["angel_key"]
+
+    api_key = _get_secret("ANGEL_API_KEY", "")
+    client_id = _get_secret("ANGEL_CLIENT_ID", "")
+    mpin = _get_secret("ANGEL_MPIN", "")
+    totp_sec = _get_secret("ANGEL_TOTP", "").replace(" ", "")
+
+    if not (api_key and client_id and mpin and totp_sec):
+        return None, None
+
     try:
-        if "ANGEL_API_KEY" in st.secrets and "ANGEL_CLIENT_ID" in st.secrets:
-            api_key = st.secrets["ANGEL_API_KEY"].strip()
-            client_id = st.secrets["ANGEL_CLIENT_ID"].strip()
-            mpin = st.secrets["ANGEL_MPIN"].strip()
-            totp = pyotp.TOTP(st.secrets["ANGEL_TOTP"].strip().replace(" ", "")).now()
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-UserType": "USER",
-                "X-SourceID": "WEB",
-                "X-ClientLocalIP": "127.0.0.1",
-                "X-ClientPublicIP": "127.0.0.1",
-                "X-MACAddress": "00:00:00:00:00:00",
-                "X-PrivateKey": api_key,
-            }
-            res = requests.post(
-                "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
-                json={"clientcode": client_id, "password": mpin, "totp": totp},
-                headers=headers,
-                timeout=10,
-            ).json()
-            if res.get("status") and res.get("data", {}).get("jwtToken"):
-                st.session_state["angel_jwt"] = res["data"]["jwtToken"]
-                st.session_state["angel_key"] = api_key
-                return st.session_state["angel_jwt"], api_key
+        totp = pyotp.TOTP(totp_sec).now()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-UserType": "USER",
+            "X-SourceID": "WEB",
+            "X-ClientLocalIP": "127.0.0.1",
+            "X-ClientPublicIP": "127.0.0.1",
+            "X-MACAddress": "00:00:00:00:00:00",
+            "X-PrivateKey": api_key,
+        }
+        res = requests.post(
+            "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
+            json={"clientcode": client_id, "password": mpin, "totp": totp},
+            headers=headers,
+            timeout=10,
+        ).json()
+        if res.get("status") and res.get("data", {}).get("jwtToken"):
+            jwt = res["data"]["jwtToken"]
+            _MEM_CACHE["angel_jwt"] = jwt
+            _MEM_CACHE["angel_key"] = api_key
+            _MEM_CACHE["angel_login_ts"] = now_ts
+            return jwt, api_key
     except Exception:
         pass
     return None, None
 
 
-@st.cache_data(ttl=3600)
 def get_scrip_master_df():
+    now_ts = time.time()
+    if "scrip_df" in _MEM_CACHE and (now_ts - _MEM_CACHE.get("scrip_ts", 0)) < 7200:
+        return _MEM_CACHE["scrip_df"]
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    res = requests.get(url, timeout=15)
-    return pd.DataFrame(res.json())
+    res = requests.get(url, timeout=18)
+    df = pd.DataFrame(res.json())
+    _MEM_CACHE["scrip_df"] = df
+    _MEM_CACHE["scrip_ts"] = now_ts
+    return df
 
 
 def get_index_meta(selected_idx):
-    """Scrip Master से असली Lot Size और एक्सचेंज डिटेल्स निकालना"""
     base_cfg = {
         "Nifty 50": {"exch": "NSE", "token": "99926000", "name": "NIFTY", "opt_exch": "NFO", "step": 50, "hedge": 500, "default_lot": 65, "yf": "^NSEI"},
         "Bank Nifty": {"exch": "NSE", "token": "99926009", "name": "BANKNIFTY", "opt_exch": "NFO", "step": 100, "hedge": 1000, "default_lot": 30, "yf": "^NSEBANK"},
@@ -233,7 +285,6 @@ def get_index_meta(selected_idx):
 # 4. सही Expiry और DTE (छुट्टियों सहित)
 # ==========================================
 def get_live_expiry_info(selected_idx):
-    """लाइव मार्केट के लिए Scrip Master से अगली असली एक्सपायरी और सटीक DTE निकालना"""
     meta = get_index_meta(selected_idx)
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
@@ -253,7 +304,6 @@ def get_live_expiry_info(selected_idx):
             nearest_exp = future_exps[0]
             exp_str = nearest_exp.strftime("%d-%b-%Y")
             cal_days = (nearest_exp - today_date).days
-            # शनिवार-रविवार घटाकर असली ट्रेडिंग DTE गिनें
             trading_dte = 0
             cur = today_date
             while cur < nearest_exp:
@@ -268,7 +318,6 @@ def get_live_expiry_info(selected_idx):
 
 
 def get_exact_t_years(expiry_str):
-    """Expiry के दिन बचे हुए असली मिनटों से सटीक T (years) निकालना"""
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     if not expiry_str or expiry_str in ["Unknown", "Simulation", "DEMO", "Backtest"]:
@@ -283,24 +332,15 @@ def get_exact_t_years(expiry_str):
 
 
 def build_backtest_dte_map(sorted_trading_dates, selected_idx):
-    """
-    बैकटेस्ट डेटा की असली ट्रेडिंग तारीखों से 0 DTE, 1 DTE आदि निकालता है।
-    यदि मंगलवार (Nifty) या गुरुवार (Sensex) को बाज़ार की छुट्टी थी,
-    तो उससे ठीक पहले वाले ट्रेडिंग दिन (जैसे सोमवार) को अपने आप 0 DTE मानता है!
-    """
     if not sorted_trading_dates:
         return {}
-
     dates_list = sorted(list(set(sorted_trading_dates)))
     date_set = set(dates_list)
     expiry_dates = set()
 
     if selected_idx == "Nifty 50":
-        target_wd = 1  # मंगलवार (Tuesday)
         for d in dates_list:
-            week_start = d - timedelta(days=d.weekday())
-            scheduled_exp = week_start + timedelta(days=target_wd)
-            # अगर scheduled_exp पर छुट्टी है, तो पीछे खिसक कर असली ट्रेडिंग दिन ढूंढें
+            scheduled_exp = (d - timedelta(days=d.weekday())) + timedelta(days=1)
             actual_exp = scheduled_exp
             for _ in range(5):
                 if actual_exp in date_set:
@@ -308,12 +348,9 @@ def build_backtest_dte_map(sorted_trading_dates, selected_idx):
                 actual_exp -= timedelta(days=1)
             if actual_exp in date_set:
                 expiry_dates.add(actual_exp)
-
     elif selected_idx == "Sensex":
-        target_wd = 3  # गुरुवार (Thursday)
         for d in dates_list:
-            week_start = d - timedelta(days=d.weekday())
-            scheduled_exp = week_start + timedelta(days=target_wd)
+            scheduled_exp = (d - timedelta(days=d.weekday())) + timedelta(days=3)
             actual_exp = scheduled_exp
             for _ in range(5):
                 if actual_exp in date_set:
@@ -321,92 +358,74 @@ def build_backtest_dte_map(sorted_trading_dates, selected_idx):
                 actual_exp -= timedelta(days=1)
             if actual_exp in date_set:
                 expiry_dates.add(actual_exp)
-
     else:
-        # Bank Nifty: महीने का आखिरी मंगलवार
         by_ym = {}
         for d in dates_list:
             by_ym.setdefault((d.year, d.month), []).append(d)
         for _, m_dates in by_ym.items():
             tuesdays = [x for x in m_dates if x.weekday() == 1]
-            if tuesdays:
-                expiry_dates.add(max(tuesdays))
-            else:
-                expiry_dates.add(max(m_dates))
+            expiry_dates.add(max(tuesdays) if tuesdays else max(m_dates))
 
     sorted_exps = sorted(list(expiry_dates))
     dte_map = {}
-    for idx_d, d in enumerate(dates_list):
+    for d in dates_list:
         future_e = [e for e in sorted_exps if e >= d]
         if not future_e:
             dte_map[d] = 0
             continue
         nxt_exp = future_e[0]
-        # दोनों तारीखों के बीच कितने असली ट्रेडिंग दिन हैं, वही सटीक DTE है
-        tr_days_between = sum(1 for x in dates_list if d < x <= nxt_exp)
-        dte_map[d] = tr_days_between
-
+        dte_map[d] = sum(1 for x in dates_list if d < x <= nxt_exp)
     return dte_map
 
 
 # ==========================================
-# 5. सटीक Change in OI इंजन (कल के क्लोज़िंग OI से)
+# 5. सटीक Change in OI इंजन (तुरंत सेविंग सहित)
 # ==========================================
 def _load_eod_oi_store():
-    if "eod_oi_store_cache" in st.session_state:
-        return st.session_state["eod_oi_store_cache"]
+    if "eod_oi_store" in _MEM_CACHE:
+        return _MEM_CACHE["eod_oi_store"]
     data = gh_read_json(EOD_OI_FILE, {"days": {}})
     if not isinstance(data.get("days"), dict):
         data = {"days": {}}
-    st.session_state["eod_oi_store_cache"] = data
+    _MEM_CACHE["eod_oi_store"] = data
     return data
 
 
 def _save_eod_oi_store(data):
-    st.session_state["eod_oi_store_cache"] = data
+    _MEM_CACHE["eod_oi_store"] = data
     gh_write_json(EOD_OI_FILE, data, "Update EOD OI baseline")
 
 
 def _get_prev_day_recorded_oi(selected_idx, today_str):
-    """recorded_oc_history.csv से पिछले ट्रेडिंग दिन का आखिरी OI निकालना"""
     try:
-        df = None
-        if st.session_state.get("rec_oc_prev_cache_date") == today_str and selected_idx in st.session_state.get("rec_oc_prev_cache", {}):
-            return st.session_state["rec_oc_prev_cache"][selected_idx]
-
+        cache_k = f"rec_prev_{selected_idx}_{today_str}"
+        if cache_k in _MEM_CACHE:
+            return _MEM_CACHE[cache_k]
         raw_txt, _, status = gh_read_text(OC_RECORD_FILE)
         if status == "OK" and raw_txt:
             df = pd.read_csv(StringIO(raw_txt))
-        if df is not None and not df.empty and "Date" in df.columns and "Index" in df.columns:
-            sub = df[(df["Index"] == selected_idx) & (df["Date"] < today_str)].copy()
-            if not sub.empty:
-                last_dt = sub["Date"].max()
-                last_day = sub[sub["Date"] == last_dt].sort_values("Time")
-                last_time = last_day["Time"].iloc[-1]
-                snap = last_day[last_day["Time"] == last_time]
-                by_strike = {}
-                for _, r in snap.iterrows():
-                    k = int(r["STRIKE"])
-                    by_strike[k] = {
-                        "CE": int(float(r.get("CALL OI", 0) or 0)),
-                        "PE": int(float(r.get("PUT OI", 0) or 0)),
-                    }
-                res_obj = {"by_strike": by_strike, "label": f"Recorded Close ({last_dt} {last_time})"}
-                st.session_state.setdefault("rec_oc_prev_cache", {})[selected_idx] = res_obj
-                st.session_state["rec_oc_prev_cache_date"] = today_str
-                return res_obj
+            if not df.empty and "Date" in df.columns and "Index" in df.columns:
+                sub = df[(df["Index"] == selected_idx) & (df["Date"] < today_str)].copy()
+                if not sub.empty:
+                    last_dt = sub["Date"].max()
+                    last_day = sub[sub["Date"] == last_dt].sort_values("Time")
+                    last_time = last_day["Time"].iloc[-1]
+                    snap = last_day[last_day["Time"] == last_time]
+                    by_strike = {}
+                    for _, r in snap.iterrows():
+                        by_strike[int(r["STRIKE"])] = {
+                            "CE": int(float(r.get("CALL OI", 0) or 0)),
+                            "PE": int(float(r.get("PUT OI", 0) or 0)),
+                        }
+                    res_obj = {"by_strike": by_strike, "label": f"Recorded Close ({last_dt} {last_time})"}
+                    _MEM_CACHE[cache_k] = res_obj
+                    return res_obj
     except Exception:
         pass
     return None
 
 
 def compute_accurate_chg_oi(selected_idx, raw_df):
-    """
-    3-परतों वाला सटीक Change in OI इंजन:
-    1) Angel Quote का netChangeOpenInterest (यदि लाइव मिल रहा हो)
-    2) पिछले ट्रेडिंग दिन का EOD OI (daily_eod_oi.json या recorded_oc_history.csv)
-    3) यदि पिछला डेटा नहीं है तो गलत संख्या की जगह None / N/A और oi_valid=False
-    """
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     today_str = now_ist.strftime("%Y-%m-%d")
@@ -415,7 +434,6 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
     store = _load_eod_oi_store()
     days_dict = store.get("days", {})
 
-    # आज से पहले का सबसे ताज़ा ट्रेडिंग दिन ढूंढें
     prev_dates = sorted([d for d in days_dict.keys() if d < today_str])
     prev_eod_map = {}
     prev_eod_label = ""
@@ -425,12 +443,8 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
         prev_eod_map = prev_day_obj.get("tokens", {})
         prev_eod_label = f"Prev Close ({last_d} {prev_day_obj.get('time', '15:25')})"
 
-    # बैकअप: recorded_oc_history.csv से पिछले दिन का क्लोज़
-    rec_prev = None
-    if not prev_eod_map:
-        rec_prev = _get_prev_day_recorded_oi(selected_idx, today_str)
+    rec_prev = _get_prev_day_recorded_oi(selected_idx, today_str) if not prev_eod_map else None
 
-    # आज का ताज़ा OI भी ईओडी स्टोर में अपडेट करते रहें (ताकि कल के लिए आज का क्लोज़ सुरक्षित रहे)
     today_entry = days_dict.get(today_str, {"time": now_time_str, "tokens": {}})
     today_tokens = today_entry.get("tokens", {})
     need_save_eod = False
@@ -448,7 +462,6 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
         api_c_chg = int(r.get("API_CALL_CHG", 0) or 0)
         api_p_chg = int(r.get("API_PUT_CHG", 0) or 0)
 
-        # आज का ताज़ा OI सेव करें
         if c_tok and c_oi > 0 and today_tokens.get(c_tok) != c_oi:
             today_tokens[c_tok] = c_oi
             need_save_eod = True
@@ -456,19 +469,16 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
             today_tokens[p_tok] = p_oi
             need_save_eod = True
 
-        # परत 1: सीधा Angel API netChangeOpenInterest
         if api_c_chg != 0 or api_p_chg != 0:
             ce_chgs.append(api_c_chg)
             pe_chgs.append(api_p_chg)
             valid_count += 1
             source_used = "Angel Live Net Chg OI ✅"
-        # परत 2: हमारे EOD Store से कल का क्लोज़िंग OI
         elif c_tok in prev_eod_map and p_tok in prev_eod_map and c_oi > 0 and p_oi > 0:
             ce_chgs.append(c_oi - int(prev_eod_map[c_tok]))
             pe_chgs.append(p_oi - int(prev_eod_map[p_tok]))
             valid_count += 1
             source_used = f"{prev_eod_label} ✅"
-        # परत 3: recorded_oc_history.csv से कल का आखिरी रिकॉर्ड
         elif rec_prev and strike_k in rec_prev["by_strike"] and c_oi > 0 and p_oi > 0:
             prev_ce = rec_prev["by_strike"][strike_k]["CE"]
             prev_pe = rec_prev["by_strike"][strike_k]["PE"]
@@ -484,18 +494,17 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
             ce_chgs.append(0)
             pe_chgs.append(0)
 
-    # हर 10 मिनट में या दिन बदलने पर EOD OI स्टोर सेव करें
-    last_eod_save_ts = st.session_state.get("last_eod_save_ts", 0)
-    if need_save_eod and (time.time() - last_eod_save_ts >= 600):
+    # पहली बार तुरंत सेव हो (0 सेकंड देरी), उसके बाद हर 5 मिनट पर अपडेट हो
+    last_eod_save_ts = _MEM_CACHE.get("last_eod_save_ts", 0)
+    if need_save_eod and (last_eod_save_ts == 0 or (time.time() - last_eod_save_ts >= 300)):
         today_entry["time"] = now_time_str
         today_entry["tokens"] = today_tokens
         days_dict[today_str] = today_entry
-        # केवल आखिरी 5 ट्रेडिंग दिन रखें ताकि फ़ाइल छोटी रहे
         for old_d in sorted(days_dict.keys())[:-5]:
             del days_dict[old_d]
         store["days"] = days_dict
         _save_eod_oi_store(store)
-        st.session_state["last_eod_save_ts"] = time.time()
+        _MEM_CACHE["last_eod_save_ts"] = time.time()
 
     oi_valid = valid_count >= max(3, len(raw_df) // 3)
     df_out = raw_df.copy()
