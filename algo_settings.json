@@ -1,0 +1,11 @@
+{
+  "main_auto_10am": true,
+  "ema_auto_arm": false,
+  "pro_auto": false,
+  "traded_dates": {
+    "main": "",
+    "ema": "",
+    "pro": ""
+  },
+  "last_tg_update_id": 0
+}
