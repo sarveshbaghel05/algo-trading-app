@@ -78,7 +78,16 @@ def _calc_bs_greeks(spot, strike, t_years, iv, opt_type="CE"):
         "gamma": round(gamma, 6),
         "theta": round(daily_theta, 2),
         "iv_pct": round(iv_safe * 100.0, 2),
+        "iv_dec": iv_safe,
     }
+
+
+def _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_decimal):
+    """0-100 स्केल पर सटीक Gamma-IV स्कोर (सामान्य दिन: 20-45, तेज़ हलचल: 50-65, पैनिक: 68+)"""
+    one_pct_move = spot_price * 0.01
+    delta_shift_1pct = avg_gamma * one_pct_move
+    raw_score = (delta_shift_1pct * 95.0) + (avg_iv_decimal * 65.0)
+    return round(min(100.0, max(5.0, raw_score)), 1)
 
 
 @st.cache_data(ttl=8)
@@ -179,7 +188,7 @@ def _fetch_real_angel_option_chain_raw(jwt_token, api_key, selected_idx):
 
 
 def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Unknown", oi_valid=True):
-    """सही Delta, Theta, Gamma-IV सुरक्षा फ़िल्टर और सटीक OI से बाज़ार का निर्णय"""
+    """सही Delta, Theta, Gamma-IV स्कोर (0-100) और सटीक OI से बाज़ार का निर्णय"""
     meta = get_index_meta(selected_idx)
     step = meta["step"]
     hedge_pts = meta["hedge"]
@@ -260,23 +269,24 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Unknow
     else:
         delta_detail = f"🟡 संतुलित बाज़ार (Net Delta: {net_delta:+} | Call: {ce_g['delta']}, Put: {pe_g['delta']})"
 
-    # 3. Gamma-IV (सही नियम: हाई स्कोर = सेलर के लिए खतरा / No-Trade)
+    # 3. Gamma-IV (सही कैलिब्रेटेड 0-100 स्केल)
     one_pct_move = spot_price * 0.01
     delta_point_risk = max(1.0, abs_net_delta * one_pct_move)
     theta_delta_eff = round((total_daily_theta / delta_point_risk) * 10.0, 2)
 
     avg_gamma = round((ce_g["gamma"] + pe_g["gamma"]) / 2.0, 6)
     avg_iv_pct = round((ce_g["iv_pct"] + pe_g["iv_pct"]) / 2.0, 2)
-    gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
+    avg_iv_dec = (ce_g["iv_dec"] + pe_g["iv_dec"]) / 2.0
+    gamma_iv_risk = _calc_calibrated_gamma_iv_score(avg_gamma, spot_price, avg_iv_dec)
 
-    if gamma_iv_risk >= 62.0:
+    if gamma_iv_risk >= 68.0:
         gamma_detail = f"🔴 अत्यधिक Gamma-IV झटका ({gamma_iv_risk}/100 | Gamma: {avg_gamma}) — अचानक तेज़ मूव का खतरा, नई सेलिंग से बचें!"
-    elif gamma_iv_risk >= 48.0:
+    elif gamma_iv_risk >= 50.0:
         gamma_detail = f"🟡 मध्यम हलचल ({gamma_iv_risk}/100 | Gamma: {avg_gamma}) — केवल साफ़ दिशा होने पर ही स्प्रेड बनाएं।"
     else:
         gamma_detail = f"🟢 शांत और स्थिर बाज़ार ({gamma_iv_risk}/100 | Gamma: {avg_gamma}) — ऑप्शन सेलिंग के लिए सुरक्षित।"
 
-    # 4. OTM 3-Strike IV Skew (महँगी साइड बेचने का सिद्धांत)
+    # 4. OTM 3-Strike IV Skew
     up_3_df = full_df[(full_df["STRIKE"] > atm_strike) & (full_df["STRIKE"] <= atm_strike + 3 * step)]
     dn_3_df = full_df[(full_df["STRIKE"] < atm_strike) & (full_df["STRIKE"] >= atm_strike - 3 * step)]
 
@@ -325,12 +335,11 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Unknow
             "iv_detail": iv_detail,
         }
 
-    # हाई Gamma-IV होने पर सेलर को सुरक्षित रखें
-    if gamma_iv_risk >= 65.0:
+    if gamma_iv_risk >= 68.0:
         return {
             "direction": "WAIT",
-            "headline": "🚨 अत्यधिक Gamma-IV खतरा — ट्रेड से बचें (NO-TRADE)",
-            "sub_headline": f"Gamma-IV स्कोर {gamma_iv_risk}/100 है — अचानक बड़े झटके का जोखिम",
+            "headline": f"🚨 अत्यधिक Gamma-IV खतरा ({gamma_iv_risk}/100) — ट्रेड से बचें",
+            "sub_headline": "अचानक बड़े झटके का जोखिम बहुत ज़्यादा है",
             "bg_color": "linear-gradient(90deg, #4c0519, #1e1b4b)",
             "border_color": "#f43f5e",
             "efficiency_score": theta_delta_eff,
@@ -369,18 +378,18 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Unknow
     if bullish_points >= 2 and bullish_points > bearish_points:
         direction = "UP"
         headline = "🟢 आज मार्केट ऊपर जा सकता है (BULLISH)"
-        sub_headline = f"नीचे Put राइटिंग मज़बूत है ({dn_put_chg:+,} vs {up_call_chg:+,}) | Theta/Delta क्षमता: {theta_delta_eff}"
+        sub_headline = f"नीचे Put राइटिंग मज़बूत है ({dn_put_chg:+,} vs {up_call_chg:+,}) | Gamma-IV: {gamma_iv_risk}/100"
         bg_color = "linear-gradient(90deg, #064e3b, #022c22)"
         border_color = "#10b981"
         trade_plan = f"क्या करें: {atm_strike} PE बेचें और {atm_strike - hedge_pts} PE हेज खरीदें (Bull Put Spread)।"
     elif bearish_points >= 2 and bearish_points > bullish_points:
         direction = "DOWN"
         headline = "🔴 आज मार्केट नीचे जा सकता है (BEARISH)"
-        sub_headline = f"ऊपर Call राइटिंग भारी है ({up_call_chg:+,} vs {dn_put_chg:+,}) | Theta/Delta क्षमता: {theta_delta_eff}"
+        sub_headline = f"ऊपर Call राइटिंग भारी है ({up_call_chg:+,} vs {dn_put_chg:+,}) | Gamma-IV: {gamma_iv_risk}/100"
         bg_color = "linear-gradient(90deg, #7f1d1d, #450a0a)"
         border_color = "#ef4444"
         trade_plan = f"क्या करें: {atm_strike} CE बेचें और {atm_strike + hedge_pts} CE हेज खरीदें (Bear Call Spread)।"
-    elif (up_call_chg > 0 or dn_put_chg > 0) and gamma_iv_risk < 50.0 and abs_net_delta < 0.08:
+    elif (up_call_chg > 0 or dn_put_chg > 0) and gamma_iv_risk < 55.0 and abs_net_delta < 0.08:
         direction = "SIDEWAYS"
         headline = "🟡 आज मार्केट साइडवेज रहेगा (RANGE-BOUND)"
         sub_headline = f"Theta गलन ₹{total_daily_theta}/दिन | Gamma-IV शांत ({gamma_iv_risk}/100) — रेंज में रहने के आसार"
@@ -390,7 +399,7 @@ def evaluate_greeks_regime(selected_idx, spot_price, full_df, expiry_str="Unknow
     else:
         direction = "WAIT"
         headline = "⏳ स्पष्ट सिग्नल की प्रतीक्षा (WAIT)"
-        sub_headline = "OI और Greeks में अभी एकतरफ़ा साफ़ सहमति नहीं बनी है"
+        sub_headline = f"Gamma-IV: {gamma_iv_risk}/100 — OI और Greeks में अभी एकतरफ़ा साफ़ सहमति नहीं बनी है"
         bg_color = "linear-gradient(90deg, #334155, #1e293b)"
         border_color = "#94a3b8"
         trade_plan = "जबरदस्ती एंट्री न लें — साफ़ OI और Greeks सहमति का इंतज़ार करें।"
