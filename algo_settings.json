@@ -1,6 +1,6 @@
 {
   "main_auto_10am": true,
-  "ema_auto_arm": false,
+  "ema_auto_arm": true,
   "pro_auto": false,
   "traded_dates": {
     "main": "",
