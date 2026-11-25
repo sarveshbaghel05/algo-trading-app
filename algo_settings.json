@@ -7,5 +7,21 @@
     "ema": "",
     "pro": ""
   },
-  "last_tg_update_id": 0
+  "last_tg_update_id": 551905287,
+  "main_indices": [
+    "Nifty 50",
+    "Sensex"
+  ],
+  "main_lots": 1,
+  "ema_indices": [
+    "Nifty 50",
+    "Sensex"
+  ],
+  "ema_tf": 5,
+  "ema_lots": 1,
+  "pro_indices": [
+    "Nifty 50",
+    "Sensex"
+  ],
+  "pro_lots": 1
 }
