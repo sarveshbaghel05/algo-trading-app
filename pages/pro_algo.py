@@ -30,7 +30,7 @@ from oi_base import (
 
 
 # ==========================================
-# Built-in Safe Fallback (ताकि कभी ModuleNotFoundError न आए)
+# Built-in Safe Fallback (सही Gamma-IV स्केल के साथ)
 # ==========================================
 def _pro_norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -59,9 +59,17 @@ def _pro_iv(option_price, spot, strike, t_years, opt_type="CE"):
     return round(0.5 * (low + high), 4)
 
 
+def _calc_pro_gamma_iv_score(avg_gamma, spot_price, avg_iv_decimal):
+    """0-100 स्केल पर सटीक Gamma-IV स्कोर (सामान्य दिन: 20-45, तेज़ हलचल: 50-65, पैनिक: 65+)"""
+    one_pct_move = spot_price * 0.01
+    delta_shift_1pct = avg_gamma * one_pct_move
+    raw_score = (delta_shift_1pct * 95.0) + (avg_iv_decimal * 65.0)
+    return round(min(100.0, max(5.0, raw_score)), 1)
+
+
 def _builtin_pro_greeks(selected_idx, spot_price, full_df, expiry_str="Unknown", oi_valid=True):
     meta = get_index_meta(selected_idx)
-    step, hedge_pts = meta["step"], meta["hedge"]
+    step = meta["step"]
     atm_strike = round(spot_price / step) * step
     if full_df is None or full_df.empty or expiry_str in ["Unknown", "Simulation", "DEMO"] or not oi_valid:
         return {
@@ -82,12 +90,12 @@ def _builtin_pro_greeks(selected_idx, spot_price, full_df, expiry_str="Unknown",
     d1_p = (math.log(spot_price / atm_strike) + (r + 0.5 * pe_iv * pe_iv) * t_years) / (pe_iv * math.sqrt(t_years))
     net_delta = round(_pro_norm_cdf(d1_c) + (_pro_norm_cdf(d1_p) - 1.0), 3)
     avg_gamma = ((_pro_norm_pdf(d1_c) / (spot_price * ce_iv * math.sqrt(t_years))) + (_pro_norm_pdf(d1_p) / (spot_price * pe_iv * math.sqrt(t_years)))) / 2.0
-    avg_iv_pct = ((ce_iv + pe_iv) / 2.0) * 100.0
-    gamma_iv_risk = round(min(100.0, (avg_gamma * spot_price * avg_iv_pct) * 2.2), 1)
+    avg_iv_dec = (ce_iv + pe_iv) / 2.0
+    gamma_iv_risk = _calc_pro_gamma_iv_score(avg_gamma, spot_price, avg_iv_dec)
 
-    if gamma_iv_risk >= 65.0:
+    if gamma_iv_risk >= 68.0:
         return {
-            "direction": "WAIT", "headline": "🚨 अत्यधिक Gamma-IV खतरा — ट्रेड से बचें",
+            "direction": "WAIT", "headline": f"🚨 अत्यधिक Gamma-IV खतरा ({gamma_iv_risk}/100) — ट्रेड से बचें",
             "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk, "trade_plan": "नई सेलिंग से बचें।"
         }
 
@@ -103,18 +111,12 @@ def _builtin_pro_greeks(selected_idx, spot_price, full_df, expiry_str="Unknown",
         return {"direction": "UP", "headline": "🟢 BULLISH", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
     elif bear_pts >= 2 and bear_pts > bull_pts:
         return {"direction": "DOWN", "headline": "🔴 BEARISH", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
-    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 50.0 and abs(net_delta) < 0.08:
+    elif (up_ce > 0 or dn_pe > 0) and gamma_iv_risk < 55.0 and abs(net_delta) < 0.08:
         return {"direction": "SIDEWAYS", "headline": "🟡 SIDEWAYS", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
     return {"direction": "WAIT", "headline": "⏳ WAIT", "gamma_iv_risk": gamma_iv_risk, "gamma_iv_score": gamma_iv_risk}
 
 
 evaluate_greeks_regime = _builtin_pro_greeks
-for _m in ["pages.greek_regime_indicator", "pages.greeks_regime_indicator", "greek_regime_indicator", "greeks_regime_indicator"]:
-    try:
-        evaluate_greeks_regime = getattr(__import__(_m, fromlist=["evaluate_greeks_regime"]), "evaluate_greeks_regime")
-        break
-    except Exception:
-        continue
 
 PRO_HISTORY_FILE = "pro_algo_history.csv"
 PRO_ACTIVE_FILE = "pro_active_trade.json"
@@ -416,7 +418,7 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     signed_move_pct = ((spot - today_open) / today_open) * 100.0 if (today_open > 0 and spot > 0) else 0.0
     morning_move_pct = abs(signed_move_pct)
     orb_range_pct = ((orb_data["high"] - orb_data["low"]) / spot) * 100.0 if orb_data.get("ok") else 0.35
-    gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 40)))
+    gamma_iv = float(g_info.get("gamma_iv_risk", g_info.get("gamma_iv_score", 35)))
 
     if morning_move_pct >= 1.0:
         dir_txt = "ऊपर (UP)" if signed_move_pct > 0 else "नीचे (DOWN)"
@@ -425,8 +427,8 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
             "score": "0/3",
             "reason": f"सुबह ({today_open:,.1f}) से अब तक {morning_move_pct:.2f}% {dir_txt} की बड़ी चाल आ चुकी है (ब्रेकआउट निकल चुका है)।"
         }
-    if gamma_iv >= 65:
-        return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 65) — पैनिक मार्केट।"}
+    if gamma_iv >= 68:
+        return {"decision": "NO_TRADE", "score": "0/3", "reason": f"Gamma-IV स्कोर अत्यधिक खतरनाक ({gamma_iv:.1f} >= 68) — पैनिक मार्केट।"}
 
     votes_up, votes_down, votes_side = 0, 0, 0
     details = []
@@ -464,21 +466,21 @@ def run_4layer_decision_engine(chain_data, orb_data, g_info):
     g_dir = g_info.get("direction", "WAIT")
     if g_dir == "UP":
         votes_up += 1
-        details.append(f"✅ L3 (Greeks): Net Delta & IV Bullish (Gamma-IV: {gamma_iv:.1f})")
+        details.append(f"✅ L3 (Greeks): Net Delta & IV Bullish (Gamma-IV: {gamma_iv:.1f}/100)")
     elif g_dir == "DOWN":
         votes_down += 1
-        details.append(f"✅ L3 (Greeks): Net Delta & IV Bearish (Gamma-IV: {gamma_iv:.1f})")
-    elif g_dir == "SIDEWAYS" and gamma_iv < 50:
+        details.append(f"✅ L3 (Greeks): Net Delta & IV Bearish (Gamma-IV: {gamma_iv:.1f}/100)")
+    elif g_dir == "SIDEWAYS" and gamma_iv < 55:
         votes_side += 1
-        details.append(f"✅ L3 (Greeks): शांत बाज़ार & तेज़ Theta गलन (Gamma-IV: {gamma_iv:.1f})")
+        details.append(f"✅ L3 (Greeks): शांत बाज़ार & तेज़ Theta गलन (Gamma-IV: {gamma_iv:.1f}/100)")
     else:
-        details.append(f"⚠️ L3 (Greeks): स्पष्ट सहमति नहीं (Gamma-IV: {gamma_iv:.1f})")
+        details.append(f"⚠️ L3 (Greeks): स्पष्ट सहमति नहीं (Gamma-IV: {gamma_iv:.1f}/100)")
 
     if votes_up >= 2 and votes_down == 0:
         return {"decision": "UP", "score": f"{votes_up}/3", "reason": "पक्की तेज़ी (High-Probability Bullish)", "details": details}
     elif votes_down >= 2 and votes_up == 0:
         return {"decision": "DOWN", "score": f"{votes_down}/3", "reason": "पक्की मंदी (High-Probability Bearish)", "details": details}
-    elif votes_side >= 2 and gamma_iv < 50:
+    elif votes_side >= 2 and gamma_iv < 55:
         return {"decision": "SIDEWAYS", "score": f"{votes_side}/3", "reason": "पक्का साइडवेज (Range-Bound Decay)", "details": details}
     else:
         return {"decision": "NO_TRADE", "score": "टकराव", "reason": "डेटा आपस में टकरा रहा है — आज पूंजी बचाना ही मुनाफ़ा है (No-Trade)।", "details": details}
@@ -548,7 +550,7 @@ if "pro_spot_track" not in st.session_state:
     st.session_state["pro_spot_track"] = {}
 
 st.title("🧠 Smart 4-Layer Pro Algo Terminal")
-st.caption("0.25 Delta OTM स्ट्राइक | Leg-wise 35% SL | VWAP + ORB + 3-Strike OI कन्फर्मेशन | सही Expiry/DTE व Lot Size")
+st.caption("0.25 Delta OTM स्ट्राइक | Leg-wise 35% SL | VWAP + ORB + 3-Strike OI कन्फर्मेशन | सही Expiry/DTE व Gamma-IV स्कोर")
 
 jwt, akey = ensure_angel_session()
 if not jwt:
@@ -720,7 +722,7 @@ with pro_tab1:
             st.info(
                 f"📍 **{p_idx} Spot:** `{live_spot:,.2f}` | **Session Base:** `{disp_open:,.2f}` (`{move_txt}`) | "
                 f"**VWAP:** `{orb_data.get('vwap', 'N/A')}` | **Expiry:** `{chain_data['exp_str']}` (**`{chain_data['dte']} DTE`**) | "
-                f"**OI स्रोत:** `{chain_data.get('oi_source', 'N/A')}` | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`"
+                f"**Gamma-IV:** `{g_info.get('gamma_iv_score', 0)}/100` | **पेपर बैलेंस:** `₹{st.session_state['pro_capital']:,.0f}`"
             )
 
             for d_line in verdict.get("details", []):
@@ -1008,5 +1010,5 @@ with pro_tab2:
                 m2.metric("सटीकता (Win Rate)", f"{wr}%", f"{wins} जीत / {len(res_df)-wins} हार")
                 m3.metric("बचाए गए No-Trade दिन", f"{skipped_days} दिन", f"Lot Size: {meta['lot']} Qty")
                 m4.metric("कुल ब्रोकरेज + टैक्स", f"-₹{int(total_costs_paid):,}")
-                st.line_chart(res_df.set_index("तारीख")["कुल पूंजी वक्र (₹)"])
+                st.line_chart(res_df.set_index("तारीख")["कुल पूंजी (₹)"])
                 st.dataframe(res_df, use_container_width=True, hide_index=True)
