@@ -44,7 +44,7 @@ def gh_read_text(filepath):
     url = f"https://api.github.com/repos/{repo}/contents/{filepath}"
     headers_meta = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     try:
-        res = requests.get(url, headers=headers_meta, timeout=8)
+        res = requests.get(url, headers=headers_meta, timeout=6)
         if res.status_code == 404:
             return None, None, "NOT_FOUND"
         if res.status_code != 200:
@@ -56,7 +56,7 @@ def gh_read_text(filepath):
             raw_txt = base64.b64decode(content_b64).decode("utf-8")
             return raw_txt, sha, "OK"
         headers_raw = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.raw"}
-        raw_res = requests.get(url, headers=headers_raw, timeout=12)
+        raw_res = requests.get(url, headers=headers_raw, timeout=10)
         if raw_res.status_code == 200:
             return raw_res.text, sha, "OK"
         return None, sha, f"RAW_ERR_{raw_res.status_code}"
@@ -78,7 +78,7 @@ def gh_write_text(filepath, text_content, commit_msg):
     if sha:
         payload["sha"] = sha
     try:
-        res = requests.put(url, json=payload, headers=headers, timeout=12)
+        res = requests.put(url, json=payload, headers=headers, timeout=10)
         if res.status_code in [200, 201]:
             return True, "Saved"
         return False, f"Err {res.status_code}"
@@ -117,7 +117,7 @@ def load_algo_settings(force_refresh=False):
     }
     now_ts = time.time()
     cache_age = now_ts - _MEM_CACHE.get("settings_ts", 0)
-    if not force_refresh and "settings_obj" in _MEM_CACHE and cache_age < 20:
+    if not force_refresh and "settings_obj" in _MEM_CACHE and cache_age < 30:
         cfg = _MEM_CACHE["settings_obj"]
         for k, v in defaults.items():
             if k not in cfg:
@@ -274,6 +274,10 @@ def get_live_expiry_info(selected_idx):
     now_ist = datetime.now(ist)
     today_date = now_ist.date()
 
+    cache_key = f"exp_{selected_idx}_{today_date}"
+    if cache_key in _MEM_CACHE:
+        return _MEM_CACHE[cache_key]
+
     try:
         mdf = get_scrip_master_df()
         opt_df = mdf[
@@ -294,7 +298,9 @@ def get_live_expiry_info(selected_idx):
                 cur += timedelta(days=1)
                 if cur.weekday() < 5:
                     trading_dte += 1
-            return exp_str, trading_dte, cal_days
+            res_tuple = (exp_str, trading_dte, cal_days)
+            _MEM_CACHE[cache_key] = res_tuple
+            return res_tuple
     except Exception:
         pass
 
@@ -382,25 +388,34 @@ def _get_prev_day_recorded_oi(selected_idx, today_str):
         cache_k = f"rec_prev_{selected_idx}_{today_str}"
         if cache_k in _MEM_CACHE:
             return _MEM_CACHE[cache_k]
-        raw_txt, _, status = gh_read_text(OC_RECORD_FILE)
-        if status == "OK" and raw_txt:
-            df = pd.read_csv(StringIO(raw_txt))
-            if not df.empty and "Date" in df.columns and "Index" in df.columns:
-                sub = df[(df["Index"] == selected_idx) & (df["Date"] < today_str)].copy()
-                if not sub.empty:
-                    last_dt = sub["Date"].max()
-                    last_day = sub[sub["Date"] == last_dt].sort_values("Time")
-                    last_time = last_day["Time"].iloc[-1]
-                    snap = last_day[last_day["Time"] == last_time]
-                    by_strike = {}
-                    for _, r in snap.iterrows():
-                        by_strike[int(r["STRIKE"])] = {
-                            "CE": int(float(r.get("CALL OI", 0) or 0)),
-                            "PE": int(float(r.get("PUT OI", 0) or 0)),
-                        }
-                    res_obj = {"by_strike": by_strike, "label": f"Recorded Close ({last_dt} {last_time})"}
-                    _MEM_CACHE[cache_k] = res_obj
-                    return res_obj
+        for candidate_path in [OC_RECORD_FILE, f"oc_logs/oc_history_{today_str}.csv"]:
+            raw_txt, _, status = gh_read_text(candidate_path)
+            if status == "OK" and raw_txt:
+                df = pd.read_csv(StringIO(raw_txt))
+                if not df.empty and "Index" in df.columns:
+                    date_col = "Date" if "Date" in df.columns else None
+                    if date_col:
+                        sub = df[(df["Index"] == selected_idx) & (df[date_col] < today_str)].copy()
+                    else:
+                        sub = df[df["Index"] == selected_idx].copy()
+                    if not sub.empty:
+                        if date_col:
+                            last_dt = sub[date_col].max()
+                            last_day = sub[sub[date_col] == last_dt].sort_values("Time")
+                        else:
+                            last_dt = today_str
+                            last_day = sub.sort_values("Time")
+                        last_time = last_day["Time"].iloc[-1]
+                        snap = last_day[last_day["Time"] == last_time]
+                        by_strike = {}
+                        for _, r in snap.iterrows():
+                            by_strike[int(r["STRIKE"])] = {
+                                "CE": int(float(r.get("CALL OI", 0) or 0)),
+                                "PE": int(float(r.get("PUT OI", 0) or 0)),
+                            }
+                        res_obj = {"by_strike": by_strike, "label": f"Recorded ({last_dt} {last_time})"}
+                        _MEM_CACHE[cache_k] = res_obj
+                        return res_obj
     except Exception:
         pass
     return None
@@ -432,7 +447,7 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
 
     ce_chgs, pe_chgs = [], []
     valid_count = 0
-    source_used = "N/A (कल का क्लोज़ OI उपलब्ध नहीं)"
+    source_used = "Live OI Baseline (कल का क्लोज़ उपलब्ध नहीं — वर्तमान OI से गणना)"
 
     for _, r in raw_df.iterrows():
         c_tok = str(r.get("CE_TOKEN", ""))
@@ -486,7 +501,8 @@ def compute_accurate_chg_oi(selected_idx, raw_df):
         _save_eod_oi_store(store)
         _MEM_CACHE["last_eod_save_ts"] = time.time()
 
-    oi_valid = valid_count >= max(3, len(raw_df) // 3)
+    has_live_oi = (int(raw_df.get("CALL OI", pd.Series([0])).sum()) + int(raw_df.get("PUT OI", pd.Series([0])).sum())) > 0
+    oi_valid = (valid_count >= max(3, len(raw_df) // 3)) or has_live_oi
     df_out = raw_df.copy()
     df_out["CALL CHG OI"] = ce_chgs
     df_out["PUT CHG OI"] = pe_chgs
