@@ -268,6 +268,72 @@ def get_index_meta(selected_idx):
     return out
 
 
+def get_top_tickers_snapshot():
+    """Nifty 50, Sensex, Nifty Bank और India VIX का हल्का कैश स्नैपशॉट देता है।"""
+    now_ts = time.time()
+    if "top_tickers_data" in _MEM_CACHE and (now_ts - _MEM_CACHE.get("top_tickers_ts", 0)) < 5:
+        return _MEM_CACHE["top_tickers_data"]
+
+    snapshot = {
+        "Nifty 50": {"ltp": 0.0, "chg": 0.0, "pct": 0.0},
+        "Sensex": {"ltp": 0.0, "chg": 0.0, "pct": 0.0},
+        "Bank Nifty": {"ltp": 0.0, "chg": 0.0, "pct": 0.0},
+        "India VIX": {"ltp": 0.0, "chg": 0.0, "pct": 0.0},
+    }
+    if "top_tickers_data" in _MEM_CACHE:
+        snapshot = {k: dict(v) for k, v in _MEM_CACHE["top_tickers_data"].items()}
+
+    jwt_tok, api_key = ensure_angel_session()
+    if jwt_tok and api_key:
+        try:
+            headers = {
+                "Authorization": f"Bearer {jwt_tok}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-UserType": "USER",
+                "X-SourceID": "WEB",
+                "X-ClientLocalIP": "127.0.0.1",
+                "X-ClientPublicIP": "127.0.0.1",
+                "X-MACAddress": "00:00:00:00:00:00",
+                "X-PrivateKey": api_key,
+            }
+            res = requests.post(
+                "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/",
+                json={
+                    "mode": "OHLC",
+                    "exchangeTokens": {
+                        "NSE": ["99926000", "99926009", "99926017"],
+                        "BSE": ["99919000"],
+                    },
+                },
+                headers=headers,
+                timeout=8,
+            ).json()
+            if res.get("status"):
+                token_map = {
+                    "99926000": "Nifty 50",
+                    "99926009": "Bank Nifty",
+                    "99919000": "Sensex",
+                    "99926017": "India VIX",
+                }
+                for item in res.get("data", {}).get("fetched", []):
+                    tok = str(item.get("symbolToken", "")).strip()
+                    label = token_map.get(tok)
+                    if label:
+                        ltp = float(item.get("ltp", 0) or 0)
+                        close_p = float(item.get("close", 0) or 0)
+                        chg = round(ltp - close_p, 2) if (ltp > 0 and close_p > 0) else 0.0
+                        pct = round((chg / close_p) * 100.0, 2) if (close_p > 0 and ltp > 0) else 0.0
+                        if ltp > 0:
+                            snapshot[label] = {"ltp": round(ltp, 2), "chg": chg, "pct": pct}
+        except Exception:
+            pass
+
+    _MEM_CACHE["top_tickers_data"] = snapshot
+    _MEM_CACHE["top_tickers_ts"] = now_ts
+    return snapshot
+
+
 def get_live_expiry_info(selected_idx):
     meta = get_index_meta(selected_idx)
     ist = pytz.timezone("Asia/Kolkata")
