@@ -7,3 +7,5 @@ requests
 pytz
 pyotp
 scipy
+fastapi
+uvicorn
