@@ -4,34 +4,34 @@
     "index": "Nifty 50",
     "tf": "5m",
     "direction": "BULLISH",
-    "strategy": "Bull Put (~39Δ)",
-    "summary": "Sell 25800 PE (Δ~0.39) / Buy 25300 PE",
+    "strategy": "Bull Put (~41Δ)",
+    "summary": "Sell 25850 PE (Δ~0.41) / Buy 25350 PE",
     "lots": 1,
     "qty": 65,
     "exch": "NFO",
     "legs": [
       {
         "action": "BUY",
-        "strike": 25300,
+        "strike": 25350,
         "side": "PE",
-        "entry_ltp": 4.3,
-        "symbol": "",
-        "token": "0",
-        "exch": "NFO",
-        "last_valid_ltp": 4.3
+        "entry_ltp": 36.6,
+        "last_valid_ltp": 36.6,
+        "symbol": "NIFTY01DEC2625350PE",
+        "token": "47805",
+        "exch": "NFO"
       },
       {
         "action": "SELL",
-        "strike": 25800,
+        "strike": 25850,
         "side": "PE",
-        "entry_ltp": 161.45,
-        "symbol": "NIFTY01DEC2625800PE",
-        "token": "47846",
-        "exch": "NFO",
-        "last_valid_ltp": 161.45
+        "entry_ltp": 169.1,
+        "last_valid_ltp": 169.1,
+        "symbol": "NIFTY01DEC2625850PE",
+        "token": "47854",
+        "exch": "NFO"
       }
     ],
-    "entry_time": "10:21:12 AM",
+    "entry_time": "10:39:48 AM",
     "sl_rs": -1700.0,
     "tsl_active": false
   }
