@@ -1,0 +1,38 @@
+{
+  "Nifty 50": {
+    "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)",
+    "index": "Nifty 50",
+    "tf": "5m",
+    "direction": "BULLISH",
+    "strategy": "Bull Put (~39Δ)",
+    "summary": "Sell 25800 PE (Δ~0.39) / Buy 25300 PE",
+    "lots": 1,
+    "qty": 65,
+    "exch": "NFO",
+    "legs": [
+      {
+        "action": "BUY",
+        "strike": 25300,
+        "side": "PE",
+        "entry_ltp": 4.3,
+        "symbol": "",
+        "token": "0",
+        "exch": "NFO",
+        "last_valid_ltp": 4.3
+      },
+      {
+        "action": "SELL",
+        "strike": 25800,
+        "side": "PE",
+        "entry_ltp": 161.45,
+        "symbol": "NIFTY01DEC2625800PE",
+        "token": "47846",
+        "exch": "NFO",
+        "last_valid_ltp": 161.45
+      }
+    ],
+    "entry_time": "10:21:12 AM",
+    "sl_rs": -1700.0,
+    "tsl_active": false
+  }
+}
