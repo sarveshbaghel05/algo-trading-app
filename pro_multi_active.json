@@ -1,1 +1,59 @@
-{}
+{
+  "Nifty 50": {
+    "mode": "🟡 Paper Trading",
+    "index": "Nifty 50",
+    "strategy": "Pro Strangle/Straddle + Leg-wise 35% SL",
+    "score": "2/3",
+    "lots": 1,
+    "qty": 65,
+    "exch": "NFO",
+    "legs": [
+      {
+        "action": "BUY",
+        "strike": 26400,
+        "side": "CE",
+        "entry_ltp": 18.3,
+        "last_valid_ltp": 18.3,
+        "closed": false,
+        "symbol": "NIFTY01DEC2626400CE",
+        "token": "47928"
+      },
+      {
+        "action": "BUY",
+        "strike": 25300,
+        "side": "PE",
+        "entry_ltp": 20.85,
+        "last_valid_ltp": 20.85,
+        "closed": false,
+        "symbol": "NIFTY01DEC2625300PE",
+        "token": "47803"
+      },
+      {
+        "action": "SELL",
+        "strike": 25900,
+        "side": "CE",
+        "entry_ltp": 131.2,
+        "last_valid_ltp": 131.2,
+        "closed": false,
+        "leg_sl_px": 177.12,
+        "symbol": "NIFTY01DEC2625900CE",
+        "token": "47855"
+      },
+      {
+        "action": "SELL",
+        "strike": 25800,
+        "side": "PE",
+        "entry_ltp": 147.45,
+        "last_valid_ltp": 147.45,
+        "closed": false,
+        "leg_sl_px": 199.06,
+        "symbol": "NIFTY01DEC2625800PE",
+        "token": "47846"
+      }
+    ],
+    "entry_time": "10:01:30 AM",
+    "max_credit_rs": 15568.0,
+    "hard_sl_rs": 5916.0,
+    "profit_locked": false
+  }
+}
