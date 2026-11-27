@@ -1,4 +1,5 @@
 तारीख,मोड,इंडेक्स,स्प्रेड,लॉट,एंट्री समय,एग्जिट समय,कारण,लाभ / हानि (₹)
+2026-11-27,Paper,Nifty 50,Straddle + Hedge - Straddle 25850 CE+PE / Hedge 500pts,1,10:00:28 AM,11:30:51 AM,Auto SL Hit,-1748.5
 2026-11-26,Paper,Nifty 50,Straddle + Hedge - Straddle 25850 CE+PE / Hedge 500pts,1,10:00:11 AM,03:15:38 PM,3:15 PM Square-Off,1501.5
 2026-11-23,Paper,Nifty 50,Sell 25650 CE / Buy 26150 CE,1,10:00:05 AM,12:53:40 PM,Manual Square-Off,4728.75
 2026-11-21,Paper,Nifty 50,Sell 25800 PE / Buy 25500 PE,1,04:46:15 PM,07:29:28 PM,Manual Square-Off,0.0
