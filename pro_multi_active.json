@@ -23,7 +23,7 @@
         "strike": 25300,
         "side": "PE",
         "entry_ltp": 20.85,
-        "last_valid_ltp": 20.85,
+        "last_valid_ltp": 37.65,
         "closed": false,
         "symbol": "NIFTY01DEC2625300PE",
         "token": "47803"
@@ -33,9 +33,9 @@
         "strike": 25900,
         "side": "CE",
         "entry_ltp": 131.2,
-        "last_valid_ltp": 131.2,
+        "last_valid_ltp": 68.8,
         "closed": false,
-        "leg_sl_px": 177.12,
+        "leg_sl_px": 131.2,
         "symbol": "NIFTY01DEC2625900CE",
         "token": "47855"
       },
@@ -44,11 +44,12 @@
         "strike": 25800,
         "side": "PE",
         "entry_ltp": 147.45,
-        "last_valid_ltp": 147.45,
-        "closed": false,
+        "last_valid_ltp": 237.8,
+        "closed": true,
         "leg_sl_px": 199.06,
         "symbol": "NIFTY01DEC2625800PE",
-        "token": "47846"
+        "token": "47846",
+        "realized_rs": -5872.75
       }
     ],
     "entry_time": "10:01:30 AM",
