@@ -1,1 +1,38 @@
-{}
+{
+  "Nifty 50": {
+    "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)",
+    "index": "Nifty 50",
+    "tf": "5m",
+    "direction": "BEARISH",
+    "strategy": "Bear Call (~44Δ)",
+    "summary": "Sell 25900 CE (Δ~0.44) / Buy 26400 CE",
+    "lots": 1,
+    "qty": 65,
+    "exch": "NFO",
+    "legs": [
+      {
+        "action": "BUY",
+        "strike": 26400,
+        "side": "CE",
+        "entry_ltp": 18.3,
+        "symbol": "NIFTY01DEC2626400CE",
+        "token": "47928",
+        "exch": "NFO",
+        "last_valid_ltp": 18.3
+      },
+      {
+        "action": "SELL",
+        "strike": 25900,
+        "side": "CE",
+        "entry_ltp": 131.2,
+        "symbol": "NIFTY01DEC2625900CE",
+        "token": "47855",
+        "exch": "NFO",
+        "last_valid_ltp": 131.2
+      }
+    ],
+    "entry_time": "10:01:30 AM",
+    "sl_rs": -1700.0,
+    "tsl_active": false
+  }
+}
