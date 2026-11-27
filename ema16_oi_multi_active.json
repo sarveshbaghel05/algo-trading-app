@@ -18,7 +18,7 @@
         "symbol": "NIFTY01DEC2626400CE",
         "token": "47928",
         "exch": "NFO",
-        "last_valid_ltp": 18.3
+        "last_valid_ltp": 14.1
       },
       {
         "action": "SELL",
@@ -28,11 +28,11 @@
         "symbol": "NIFTY01DEC2625900CE",
         "token": "47855",
         "exch": "NFO",
-        "last_valid_ltp": 131.2
+        "last_valid_ltp": 102.9
       }
     ],
     "entry_time": "10:01:30 AM",
-    "sl_rs": -1700.0,
-    "tsl_active": false
+    "sl_rs": 200.0,
+    "tsl_active": true
   }
 }
