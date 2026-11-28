@@ -9,7 +9,6 @@ import pytz
 import pandas as pd
 import requests
 
-# oi_base को इम्पोर्ट करें
 from oi_base import (
     ensure_angel_session,
     get_scrip_master_df,
@@ -197,7 +196,7 @@ def fetch_chain_worker(jwt, akey, selected_idx):
                 "PUT LTP": float(pq.get("ltp", 0.0) or 0.0),
                 "PUT OI": int(float(pq.get("opnInterest", 0) or 0)),
                 "API_PUT_CHG": int(float(pq.get("netChangeOpenInterest", 0) or 0)),
-                "PUT VOL": int(float(cq.get("tradeVolume", 0) or 0)),
+                "PUT VOL": int(float(pq.get("tradeVolume", 0) or 0)),
                 "DTE": max(0.2, float(dte)),
             }
         )
@@ -452,4 +451,41 @@ def worker_loop():
                                                 lg.update(
                                                     {
                                                         "symbol": ci["symbol"],
-                                                        "
+                                                        "token": ci["token"],
+                                                        "exch": ci["exch"],
+                                                        "last_valid_ltp": lg["entry_ltp"],
+                                                    }
+                                                )
+                                            m_map[idx_nm] = {
+                                                "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)",
+                                                "index": idx_nm,
+                                                "strategy": sn,
+                                                "summary": ss,
+                                                "lots": lots,
+                                                "qty": meta["lot"] * lots,
+                                                "exch": meta["opt_exch"],
+                                                "legs": legs,
+                                                "entry_time": now_str,
+                                                "sl_rs": 1700.0 * lots,
+                                                "last_mtm": 0.0,
+                                            }
+                                            m_changed = True
+                                            mark_strategy_traded_today("main", today_str, idx_nm)
+                                            tg_send(f"🚀 <b>CLOUD 10AM AUTO-ENTRY ({idx_nm})</b>\n{sn}: {ss}\nTime: {now_str}")
+
+                        if m_changed:
+                            gh_write_text(
+                                "active_trades_multi.json",
+                                json.dumps(m_map, ensure_ascii=False, indent=2),
+                                "Worker update active trades",
+                            )
+                        WORKER_STATUS["active_trades"] = len(m_map) + len(ema_map) + len(pro_map)
+        except Exception as e:
+            WORKER_STATUS["last_error"] = f"worker_loop: {e}"
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    t = threading.Thread(target=worker_loop, daemon=True)
+    t.start()
+    start_web_server()
