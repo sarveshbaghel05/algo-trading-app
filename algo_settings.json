@@ -10,7 +10,7 @@
     "ema_Nifty 50": "2026-11-27",
     "pro_Nifty 50": "2026-11-27"
   },
-  "last_tg_update_id": 551905298,
+  "last_tg_update_id": 551905299,
   "main_indices": [
     "Nifty 50",
     "Sensex"
@@ -26,5 +26,6 @@
     "Nifty 50",
     "Sensex"
   ],
-  "pro_lots": 1
+  "pro_lots": 1,
+  "main_live_mode": false
 }
