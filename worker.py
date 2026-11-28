@@ -9,6 +9,7 @@ import pytz
 import pandas as pd
 import requests
 
+# oi_base को इम्पोर्ट करें
 from oi_base import (
     ensure_angel_session,
     get_scrip_master_df,
@@ -25,9 +26,6 @@ from oi_base import (
     _get_secret,
 )
 
-# ==========================================
-# 1. Tiny Web Server (Render Free Plan के लिए)
-# ==========================================
 WORKER_STATUS = {
     "last_tick": "Starting...",
     "active_trades": 0,
@@ -53,9 +51,6 @@ def start_web_server():
     server.serve_forever()
 
 
-# ==========================================
-# 2. Telegram & Angel Quote Helpers
-# ==========================================
 def tg_send(msg):
     try:
         tok = _get_secret("TELEGRAM_BOT_TOKEN", "")
@@ -90,13 +85,13 @@ def check_tg_cmd():
             if uid > max_u:
                 max_u = uid
             m = u.get("message", {})
-            if now_ts - float(m.get("date", now_ts)) > 120:
+            if now_ts - float(m.get("date", now_ts)) > 180:
                 continue
             if str(m.get("chat", {}).get("id", "")) == str(cid):
                 txt = m.get("text", "").strip().upper()
-                if txt in ["/EXIT", "EXIT", "STOP"]:
+                if txt in ["/EXIT", "EXIT", "STOP", "CLOSE"]:
                     cmd = "EXIT"
-                elif txt in ["/STATUS", "STATUS", "MTM"]:
+                elif txt in ["/STATUS", "STATUS", "MTM", "PNL"]:
                     cmd = "STATUS"
         if max_u > last_off:
             save_tg_offset(max_u)
@@ -202,7 +197,7 @@ def fetch_chain_worker(jwt, akey, selected_idx):
                 "PUT LTP": float(pq.get("ltp", 0.0) or 0.0),
                 "PUT OI": int(float(pq.get("opnInterest", 0) or 0)),
                 "API_PUT_CHG": int(float(pq.get("netChangeOpenInterest", 0) or 0)),
-                "PUT VOL": int(float(pq.get("tradeVolume", 0) or 0)),
+                "PUT VOL": int(float(cq.get("tradeVolume", 0) or 0)),
                 "DTE": max(0.2, float(dte)),
             }
         )
@@ -220,9 +215,6 @@ def fetch_chain_worker(jwt, akey, selected_idx):
     }
 
 
-# ==========================================
-# 3. Permanent Option Chain Logger (तीनों इंडेक्स)
-# ==========================================
 _LAST_LOG_MIN = {}
 _LAST_GH_SYNC = 0.0
 
@@ -240,9 +232,10 @@ def save_oc_permanent(idx_nm, cd, now_ist):
     cols = ["STRIKE", "CALL VOL", "CALL CHG OI", "CALL OI", "CALL LTP", "PUT LTP", "PUT OI", "PUT CHG OI", "PUT VOL"]
     sdf = cd["df"][cols].copy()
     sdf.insert(0, "Time", now_ist.strftime("%H:%M"))
-    sdf.insert(1, "Index", idx_nm)
-    sdf.insert(2, "Spot", round(cd["spot"], 2))
-    sdf.insert(3, "Expiry", cd["exp_str"])
+    sdf.insert(1, "Date", today_str)
+    sdf.insert(2, "Index", idx_nm)
+    sdf.insert(3, "Spot", round(cd["spot"], 2))
+    sdf.insert(4, "Expiry", cd["exp_str"])
 
     write_hdr = not os.path.exists(day_file)
     sdf.to_csv(day_file, mode="a", header=write_hdr, index=False)
@@ -256,9 +249,6 @@ def save_oc_permanent(idx_nm, cd, now_ist):
         _LAST_GH_SYNC = time.time()
 
 
-# ==========================================
-# 4. Signal & Paper Trade Execution Engine
-# ==========================================
 def _signal_dir(cd):
     step = cd["info"]["step"]
     atm = cd["atm"]
@@ -335,20 +325,47 @@ def _calc_trade_mtm(tr, cd):
     return mtm
 
 
-def _send_all_trips_status(m_map, chains, now_str):
-    if not m_map:
-        tg_send(f"📊 <b>WORKER STATUS ({now_str})</b>\nकोई खुला ट्रिप/ट्रेड नहीं चल रहा है।")
+def _load_json_gh(fname):
+    raw, _, st_c = gh_read_text(fname)
+    if st_c == "OK" and raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
+
+
+def _send_all_trips_status(m_map, ema_map, pro_map, chains, now_str):
+    entries = []
+    for key, tr in (m_map or {}).items():
+        idx_nm = tr.get("index", key)
+        strat_nm = tr.get("strategy", tr.get("summary", "Main"))
+        mtm = _calc_trade_mtm(tr, chains.get(idx_nm))
+        entries.append((f"Main • {idx_nm}", strat_nm, mtm))
+
+    for key, tr in (ema_map or {}).items():
+        idx_nm = tr.get("index", key)
+        strat_nm = tr.get("summary", tr.get("strategy", "16 EMA"))
+        mtm = _calc_trade_mtm(tr, chains.get(idx_nm))
+        entries.append((f"16EMA • {idx_nm}", strat_nm, mtm))
+
+    for key, tr in (pro_map or {}).items():
+        idx_nm = tr.get("index", key)
+        strat_nm = tr.get("strategy", "Pro Algo")
+        mtm = _calc_trade_mtm(tr, chains.get(idx_nm))
+        entries.append((f"Pro • {idx_nm}", strat_nm, mtm))
+
+    if not entries:
+        tg_send(f"📊 <b>ALL ACTIVE POSITIONS ({now_str})</b>\nअभी कोई खुली पोजीशन नहीं चल रही है।")
         return
 
-    lines = [f"📊 <b>ALL ACTIVE TRIPS MTM ({now_str})</b>"]
+    lines = [f"📊 <b>ALL ACTIVE POSITIONS ({len(entries)}) — {now_str}</b>"]
     total_mtm = 0.0
-    for key, tr in m_map.items():
-        idx_nm = tr.get("index", key)
-        strat_nm = tr.get("strategy", tr.get("summary", "Strategy"))
-        mtm = _calc_trade_mtm(tr, chains.get(idx_nm))
+    for tag, strat_nm, mtm in entries:
         total_mtm += mtm
-        lines.append(f"• <b>{idx_nm}</b> | {strat_nm}: <b>₹{mtm:+,.0f}</b>")
-
+        lines.append(f"• <b>{tag}</b> ({strat_nm}): <b>₹{mtm:+,.0f}</b>")
     lines.append(f"━━━━━━━━━━━━━━━\n<b>कुल (Total) MTM: ₹{total_mtm:+,.0f}</b>")
     tg_send("\n".join(lines))
 
@@ -366,25 +383,26 @@ def worker_loop():
                     now_str = now_ist.strftime("%I:%M:%S %p")
                     tg_cmd = check_tg_cmd()
 
-                    raw_m, _, st_m = gh_read_text("active_trades_multi.json")
-                    m_map = json.loads(raw_m) if (st_m == "OK" and raw_m) else {}
+                    m_map = _load_json_gh("active_trades_multi.json")
+                    ema_map = _load_json_gh("ema16_oi_multi_active.json")
+                    pro_map = _load_json_gh("pro_multi_active.json")
                     m_changed = False
-
-                    # यदि /STATUS आया है तो chains fetch करने से पहले ही तुरंत मौजूदा MTM भेजें
-                    if tg_cmd == "STATUS":
-                        _send_all_trips_status(m_map, {}, now_str)
 
                     jwt, akey = ensure_angel_session()
                     chains = {}
                     if jwt and akey:
-                        cfg = load_algo_settings(force_refresh=True)
-                        today_str = now_ist.strftime("%Y-%m-%d")
-
                         for idx_nm in ["Nifty 50", "Bank Nifty", "Sensex"]:
                             cd = fetch_chain_worker(jwt, akey, idx_nm)
                             if cd:
                                 chains[idx_nm] = cd
                                 save_oc_permanent(idx_nm, cd, now_ist)
+
+                    if tg_cmd == "STATUS":
+                        _send_all_trips_status(m_map, ema_map, pro_map, chains, now_str)
+
+                    if jwt and akey:
+                        cfg = load_algo_settings(force_refresh=True)
+                        today_str = now_ist.strftime("%Y-%m-%d")
 
                         for idx_nm in list(m_map.keys()):
                             tr = m_map[idx_nm]
@@ -434,41 +452,4 @@ def worker_loop():
                                                 lg.update(
                                                     {
                                                         "symbol": ci["symbol"],
-                                                        "token": ci["token"],
-                                                        "exch": ci["exch"],
-                                                        "last_valid_ltp": lg["entry_ltp"],
-                                                    }
-                                                )
-                                            m_map[idx_nm] = {
-                                                "mode": "🟡 PAPER TRADING (वर्चुअल प्रैक्टिस)",
-                                                "index": idx_nm,
-                                                "strategy": sn,
-                                                "summary": ss,
-                                                "lots": lots,
-                                                "qty": meta["lot"] * lots,
-                                                "exch": meta["opt_exch"],
-                                                "legs": legs,
-                                                "entry_time": now_str,
-                                                "sl_rs": 1700.0 * lots,
-                                                "last_mtm": 0.0,
-                                            }
-                                            m_changed = True
-                                            mark_strategy_traded_today("main", today_str, idx_nm)
-                                            tg_send(f"🚀 <b>CLOUD 10AM AUTO-ENTRY ({idx_nm})</b>\n{sn}: {ss}\nTime: {now_str}")
-
-                        if m_changed:
-                            gh_write_text(
-                                "active_trades_multi.json",
-                                json.dumps(m_map, ensure_ascii=False, indent=2),
-                                "Worker update active trades",
-                            )
-                        WORKER_STATUS["active_trades"] = len(m_map)
-        except Exception as e:
-            WORKER_STATUS["last_error"] = f"worker_loop: {e}"
-        time.sleep(15)
-
-
-if __name__ == "__main__":
-    t = threading.Thread(target=worker_loop, daemon=True)
-    t.start()
-    start_web_server()
+                                                        "
