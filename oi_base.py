@@ -86,6 +86,77 @@ def gh_write_text(filepath, text_content, commit_msg):
         return False, str(e)
 
 
+def gh_list_oc_logs():
+    """GitHub oc_logs फ़ोल्डर में सेव हुई दैनिक OC CSV फ़ाइलों की सूची लौटाता है।"""
+    cache_k = "gh_oc_logs_list"
+    now_ts = time.time()
+    if cache_k in _MEM_CACHE and (now_ts - _MEM_CACHE[cache_k]["ts"]) < 60:
+        return _MEM_CACHE[cache_k]["files"]
+
+    token, repo = get_gh_config()
+    found = []
+    if token:
+        url = f"https://api.github.com/repos/{repo}/contents/oc_logs"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+        try:
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code == 200 and isinstance(res.json(), list):
+                for item in res.json():
+                    nm = str(item.get("name", ""))
+                    if nm.startswith("oc_history_") and nm.endswith(".csv"):
+                        found.append(f"oc_logs/{nm}")
+        except Exception:
+            pass
+
+    if not found and os.path.isdir("oc_logs"):
+        for nm in sorted(os.listdir("oc_logs")):
+            if nm.startswith("oc_history_") and nm.endswith(".csv"):
+                found.append(f"oc_logs/{nm}")
+
+    found = sorted(list(set(found)))
+    _MEM_CACHE[cache_k] = {"ts": now_ts, "files": found}
+    return found
+
+
+def load_recorded_oc_dataframe(selected_idx=None):
+    """GitHub या लोकल से सेव्ड ओरिजिनल ऑप्शन चेन डेटा को एक DataFrame में जोड़ता है।"""
+    frames = []
+    paths = gh_list_oc_logs()
+    if OC_RECORD_FILE not in paths:
+        paths.append(OC_RECORD_FILE)
+
+    for p in paths:
+        raw_txt = None
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    raw_txt = f.read()
+            except Exception:
+                raw_txt = None
+        if not raw_txt:
+            txt, _, st_code = gh_read_text(p)
+            if st_code == "OK" and txt:
+                raw_txt = txt
+        if raw_txt:
+            try:
+                df_part = pd.read_csv(StringIO(raw_txt))
+                if not df_part.empty:
+                    if "Date" not in df_part.columns and "oc_history_" in p:
+                        dt_part = p.split("oc_history_")[-1].replace(".csv", "")
+                        df_part["Date"] = dt_part
+                    frames.append(df_part)
+            except Exception:
+                pass
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+    if selected_idx and "Index" in combined.columns:
+        combined = combined[combined["Index"] == selected_idx].copy()
+    return combined
+
+
 def gh_read_json(filepath, default_val=None):
     raw, _, status = gh_read_text(filepath)
     if status == "OK" and raw:
@@ -103,6 +174,7 @@ def gh_write_json(filepath, data_obj, commit_msg):
 def load_algo_settings(force_refresh=False):
     defaults = {
         "main_auto_10am": False,
+        "main_live_mode": False,
         "main_indices": ["Nifty 50", "Sensex"],
         "main_lots": 1,
         "ema_auto_arm": False,
@@ -269,7 +341,6 @@ def get_index_meta(selected_idx):
 
 
 def get_top_tickers_snapshot():
-    """Nifty 50, Sensex, Nifty Bank और India VIX का हल्का कैश स्नैपशॉट देता है।"""
     now_ts = time.time()
     if "top_tickers_data" in _MEM_CACHE and (now_ts - _MEM_CACHE.get("top_tickers_ts", 0)) < 5:
         return _MEM_CACHE["top_tickers_data"]
@@ -454,7 +525,7 @@ def _get_prev_day_recorded_oi(selected_idx, today_str):
         cache_k = f"rec_prev_{selected_idx}_{today_str}"
         if cache_k in _MEM_CACHE:
             return _MEM_CACHE[cache_k]
-        for candidate_path in [OC_RECORD_FILE, f"oc_logs/oc_history_{today_str}.csv"]:
+        for candidate_path in [OC_RECORD_FILE] + gh_list_oc_logs():
             raw_txt, _, status = gh_read_text(candidate_path)
             if status == "OK" and raw_txt:
                 df = pd.read_csv(StringIO(raw_txt))
